@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_NAME="SS Codex"
+SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/ss-codex/main/ss-codex.sh"
 CMD_PATH="/usr/local/bin/sscodex"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="$CONFIG_DIR/config.json"
@@ -58,17 +59,34 @@ install_self_command() {
     local src
     src="${BASH_SOURCE[0]:-$0}"
 
+    mkdir -p "$(dirname "$CMD_PATH")"
+
     case "$src" in
-        /dev/fd/*|/proc/*) return 0 ;;
+        /dev/fd/*|/proc/*)
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL "$SCRIPT_URL" -o "$CMD_PATH" 2>/dev/null || {
+                    warn "管理命令安装失败，可重新运行安装命令。"
+                    return 0
+                }
+                chmod 755 "$CMD_PATH" 2>/dev/null || true
+                return 0
+            fi
+            warn "未找到 curl，暂时无法安装 sscodex 管理命令。"
+            return 0
+            ;;
     esac
 
     [ -f "$src" ] || return 0
-    mkdir -p "$(dirname "$CMD_PATH")"
 
     if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
         cp "$src" "$CMD_PATH" 2>/dev/null || true
-        chmod +x "$CMD_PATH" 2>/dev/null || true
+        chmod 755 "$CMD_PATH" 2>/dev/null || true
     fi
+}
+
+secure_config_dir() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
 }
 
 install_deps() {
@@ -244,7 +262,7 @@ save_state() {
     local port="$3"
     local password="$4"
 
-    mkdir -p "$CONFIG_DIR"
+    secure_config_dir
     {
         printf 'DOMAIN=%q\n' "$domain"
         printf 'NAME=%q\n' "$name"
@@ -252,6 +270,7 @@ save_state() {
         printf 'PASSWORD=%q\n' "$password"
         printf 'METHOD=%q\n' "$METHOD"
     } > "$STATE_FILE"
+    chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
 normalize_host() {
@@ -306,7 +325,9 @@ generate_link() {
 }
 
 write_uri_file() {
+    secure_config_dir
     generate_link > "$URI_FILE"
+    chmod 600 "$URI_FILE" 2>/dev/null || true
 }
 
 port_in_use() {
@@ -340,7 +361,7 @@ write_config() {
     local port="$1"
     local password="$2"
 
-    mkdir -p "$CONFIG_DIR"
+    secure_config_dir
     cat > "$CONFIG_PATH" <<EOF
 {
   "log": {
@@ -351,7 +372,7 @@ write_config() {
     {
       "type": "shadowsocks",
       "tag": "ss-codex-in",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": $port,
       "method": "$METHOD",
       "password": "$password"
@@ -365,6 +386,7 @@ write_config() {
   ]
 }
 EOF
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 
     sing-box check -c "$CONFIG_PATH" >/dev/null
 }
@@ -576,7 +598,6 @@ uninstall_all() {
     rm -rf "$CONFIG_DIR"
     rm -f /usr/bin/sing-box /usr/local/bin/sing-box
     rm -f "$CMD_PATH" /usr/bin/sscodex
-    rm -f /usr/local/bin/sb /usr/bin/sb
     rm -f /var/log/sing-box.log /var/log/sing-box.err
 
     info "卸载完成。"
