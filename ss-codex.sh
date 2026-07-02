@@ -638,7 +638,7 @@ EOF
 }
 
 uninstall_all() {
-    echo "此操作会卸载 sing-box，并删除所有节点配置。"
+    echo "此操作会卸载 SS Codex、sing-box，并删除所有节点配置。"
     read -r -p "确认继续？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
 
@@ -673,6 +673,8 @@ uninstall_all() {
     rm -f /var/log/sing-box*
 
     info "卸载完成。"
+    info "sscodex 命令已删除，当前菜单即将退出。"
+    exit 0
 }
 
 start_service_action() {
@@ -733,7 +735,7 @@ show_menu() {
  9) 一键开启 BBR + fq
 10) 更新 sing-box
 11) 更新 sscodex 脚本
-12) 卸载 sing-box，并删除所有节点配置
+12) 卸载 SS Codex、sing-box，并删除所有节点配置
  0) 退出
 ========================================
 EOF
