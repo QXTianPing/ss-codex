@@ -60,6 +60,52 @@ install_command_alias() {
     ln -sf "$CMD_PATH" /usr/bin/sscodex 2>/dev/null || true
 }
 
+ensure_curl() {
+    if command -v curl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    info "未检测到 curl，正在安装依赖..."
+    install_deps
+
+    if command -v curl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    err "未找到 curl，无法继续。"
+    return 1
+}
+
+download_sscodex_script() {
+    local dest="$1"
+    local tmp
+
+    ensure_curl || return 1
+
+    mkdir -p "$(dirname "$dest")"
+    if command -v mktemp >/dev/null 2>&1; then
+        tmp="$(mktemp "${dest}.tmp.XXXXXX")"
+    else
+        tmp="${dest}.tmp.$$"
+        : > "$tmp"
+    fi
+
+    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        err "下载失败，请检查网络或 GitHub raw 地址。"
+        return 1
+    fi
+
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        err "下载到的脚本未通过语法检查，已保留当前版本。"
+        return 1
+    fi
+
+    chmod 755 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$dest"
+}
+
 install_self_command() {
     local src
     src="${BASH_SOURCE[0]:-$0}"
@@ -68,15 +114,11 @@ install_self_command() {
 
     case "$src" in
         /dev/fd/*|/proc/*)
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSL "$SCRIPT_URL" -o "$CMD_PATH" 2>/dev/null || {
-                    warn "管理命令安装失败，可重新运行安装命令。"
-                    return 0
-                }
+            if download_sscodex_script "$CMD_PATH"; then
                 install_command_alias
                 return 0
             fi
-            warn "未找到 curl，暂时无法安装 sscodex 管理命令。"
+            warn "管理命令安装失败，可重新运行安装命令。"
             return 0
             ;;
     esac
@@ -148,6 +190,7 @@ install_singbox_if_missing() {
             apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
             ;;
         *)
+            ensure_curl || exit 1
             bash <(curl -fsSL https://sing-box.app/install.sh)
             ;;
     esac
@@ -683,6 +726,7 @@ delete_node() {
 
 update_singbox() {
     install_deps
+    ensure_curl || return 1
     info "正在更新 sing-box..."
     bash <(curl -fsSL https://sing-box.app/install.sh)
 
@@ -695,41 +739,8 @@ update_singbox() {
 }
 
 update_sscodex() {
-    local tmp
-
-    if ! command -v curl >/dev/null 2>&1; then
-        info "未检测到 curl，正在安装依赖..."
-        install_deps
-    fi
-
-    if ! command -v curl >/dev/null 2>&1; then
-        err "未找到 curl，无法更新 sscodex。"
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$CMD_PATH")"
-    if command -v mktemp >/dev/null 2>&1; then
-        tmp="$(mktemp "${CMD_PATH}.tmp.XXXXXX")"
-    else
-        tmp="${CMD_PATH}.tmp.$$"
-        : > "$tmp"
-    fi
-
     info "正在下载最新 sscodex 脚本..."
-    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
-        rm -f "$tmp"
-        err "下载失败，请检查网络或 GitHub raw 地址。"
-        return 1
-    fi
-
-    if ! bash -n "$tmp"; then
-        rm -f "$tmp"
-        err "下载到的脚本未通过语法检查，已保留当前版本。"
-        return 1
-    fi
-
-    chmod 755 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$CMD_PATH"
+    download_sscodex_script "$CMD_PATH" || return 1
     install_command_alias
 
     info "sscodex 已覆盖更新。"
