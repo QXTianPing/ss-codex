@@ -6,6 +6,7 @@
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/ss-codex/main/ss-codex.sh)
+```
 
 ## 管理命令
 
@@ -13,3 +14,4 @@ bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/ss-codex/main/ss-
 
 ```bash
 sscodex
+```
