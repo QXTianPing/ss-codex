@@ -598,6 +598,7 @@ uninstall_all() {
     rm -rf "$CONFIG_DIR"
     rm -f /usr/bin/sing-box /usr/local/bin/sing-box
     rm -f "$CMD_PATH" /usr/bin/sscodex
+    rm -f /usr/local/bin/sb /usr/bin/sb
     rm -f /var/log/sing-box.log /var/log/sing-box.err
 
     info "卸载完成。"
