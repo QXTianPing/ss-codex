@@ -733,7 +733,8 @@ update_sscodex() {
     install_command_alias
 
     info "sscodex 已覆盖更新。"
-    info "再次输入 sscodex 可打开新版管理面板。"
+    info "正在重新打开新版管理面板..."
+    exec "$CMD_PATH"
 }
 
 bbr_state() {
