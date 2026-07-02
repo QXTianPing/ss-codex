@@ -303,7 +303,122 @@ normalize_host() {
         fi
     fi
 
+    host="${host%.}"
     echo "$host"
+}
+
+is_ipv4_address() {
+    local ip="$1"
+    local IFS=.
+    local -a parts
+    local part
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r -a parts <<< "$ip"
+    [ "${#parts[@]}" -eq 4 ] || return 1
+
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        ((10#$part <= 255)) || return 1
+    done
+}
+
+is_ipv6_address_basic() {
+    local ip="$1"
+    local no_colons
+    local colon_count
+    local without_double
+    local double_count
+    local check_ip
+    local maybe_v4
+    local rest
+    local chunk
+
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    [[ "$ip" != *:::* ]] || return 1
+    [[ "$ip" != :[^:]* ]] || return 1
+    [[ "$ip" != *[^:]: ]] || return 1
+
+    without_double="${ip//::/}"
+    double_count=$(((${#ip} - ${#without_double}) / 2))
+    [ "$double_count" -le 1 ] || return 1
+
+    maybe_v4="${ip##*:}"
+    check_ip="$ip"
+    if [[ "$maybe_v4" == *.* ]]; then
+        is_ipv4_address "$maybe_v4" || return 1
+        check_ip="${ip%:*}:0"
+    fi
+
+    no_colons="${check_ip//:/}"
+    colon_count=$((${#check_ip} - ${#no_colons}))
+    [ "$colon_count" -ge 2 ] || return 1
+    [ "$colon_count" -le 7 ] || return 1
+    if [[ "$check_ip" != *::* ]] && [ "$colon_count" -ne 7 ]; then
+        return 1
+    fi
+
+    rest="$check_ip"
+    while [[ "$rest" == *:* ]]; do
+        chunk="${rest%%:*}"
+        if [ -n "$chunk" ] && [[ ! "$chunk" =~ ^[0-9A-Fa-f]{1,4}$ ]]; then
+            return 1
+        fi
+        rest="${rest#*:}"
+    done
+    [ -z "$rest" ] || [[ "$rest" =~ ^[0-9A-Fa-f]{1,4}$ ]]
+}
+
+is_ip_address() {
+    local host="$1"
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$host" <<'PY' >/dev/null 2>&1
+import ipaddress
+import sys
+
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+PY
+        return $?
+    fi
+
+    is_ipv4_address "$host" || is_ipv6_address_basic "$host"
+}
+
+is_domain_name() {
+    local domain="$1"
+    local IFS=.
+    local -a labels
+    local label
+    local last
+
+    [ "${#domain}" -ge 4 ] || return 1
+    [ "${#domain}" -le 253 ] || return 1
+    [[ "$domain" == *.* ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$domain" != *..* ]] || return 1
+
+    read -r -a labels <<< "$domain"
+    [ "${#labels[@]}" -ge 2 ] || return 1
+
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] || return 1
+        [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] || return 1
+    done
+
+    last="${labels[${#labels[@]}-1]}"
+    [ "${#last}" -ge 2 ] || return 1
+    [[ "$last" =~ [A-Za-z] ]]
+}
+
+is_valid_node_host() {
+    local host="$1"
+    is_ip_address "$host" || is_domain_name "$host"
 }
 
 uri_host() {
@@ -490,12 +605,19 @@ create_or_rebuild_node() {
     local port
     local password
 
-    read -r -p "请输入节点域名或 IP：" input_host
-    domain="$(normalize_host "$input_host")"
-    if [ -z "$domain" ]; then
-        err "节点域名或 IP 不能为空。"
-        return 1
-    fi
+    while true; do
+        read -r -p "请输入节点域名或 IP：" input_host
+        domain="$(normalize_host "$input_host")"
+        if [ -z "$domain" ]; then
+            err "节点域名或 IP 不能为空，请重新输入。"
+            continue
+        fi
+        if ! is_valid_node_host "$domain"; then
+            err "格式不正确，请输入类似 sb.637892.xyz、1.2.3.4 或 2001:db8::1。"
+            continue
+        fi
+        break
+    done
 
     default_name="$(default_name_for_host "$domain")"
     read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
