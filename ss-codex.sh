@@ -1382,10 +1382,31 @@ run_nexttrace_target() {
     local ip="$1"
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout 45 nexttrace -n -P -C "$ip" 2>&1
+        timeout 30 nexttrace -n -P -C "$ip" 2>&1
     else
         nexttrace -n -P -C "$ip" 2>&1
     fi
+}
+
+check_route_target() {
+    local name="$1"
+    local ip="$2"
+    local result_file="$3"
+    local output
+    local detected
+    local result
+    local asn
+
+    if output="$(run_nexttrace_target "$ip")"; then
+        detected="$(detect_trace_line "$output")"
+        result="${detected%%|*}"
+        asn="${detected#*|}"
+    else
+        result="检测失败"
+        asn="-"
+    fi
+
+    printf '%-10s %-15s %-10s %s\n' "$name" "$ip" "$result" "$asn" > "$result_file"
 }
 
 show_backtrace_routes() {
@@ -1394,10 +1415,11 @@ show_backtrace_routes() {
     local i
     local name
     local ip
-    local output
-    local detected
-    local result
-    local asn
+    local tmp_dir
+    local result_file
+
+    tmp_dir="$(mktemp -d /tmp/sscodex-trace.XXXXXX)"
+    trap 'rm -rf "$tmp_dir"' RETURN
 
     cat <<EOF
 ========================================
@@ -1409,18 +1431,22 @@ EOF
     for i in "${!TRACE_NAMES[@]}"; do
         name="${TRACE_NAMES[$i]}"
         ip="${TRACE_IPS[$i]}"
-
-        if output="$(run_nexttrace_target "$ip")"; then
-            detected="$(detect_trace_line "$output")"
-            result="${detected%%|*}"
-            asn="${detected#*|}"
-        else
-            result="检测失败"
-            asn="-"
-        fi
-
-        printf '%-10s %-15s %-10s %s\n' "$name" "$ip" "$result" "$asn"
+        check_route_target "$name" "$ip" "$tmp_dir/$i" &
     done
+
+    wait
+
+    for i in "${!TRACE_NAMES[@]}"; do
+        result_file="$tmp_dir/$i"
+        if [ -s "$result_file" ]; then
+            cat "$result_file"
+        else
+            printf '%-10s %-15s %-10s %s\n' "${TRACE_NAMES[$i]}" "${TRACE_IPS[$i]}" "检测失败" "-"
+        fi
+    done
+
+    rm -rf "$tmp_dir"
+    trap - RETURN
 
     cat <<EOF
 ========================================
@@ -1518,24 +1544,33 @@ show_menu() {
  IPv4 DNS：
 $(ipv4_dns_lines)
 ----------------------------------------
+ 节点管理
  1) 创建/重建 SS 2022 节点
  2) 查看节点链接
  3) 删除当前节点
 ----------------------------------------
+ 服务管理
  4) 启动 sing-box 服务
  5) 停止 sing-box 服务
  6) 重启 sing-box 服务
  7) 查看 sing-box 状态
  8) 查看 sing-box 日志
 ----------------------------------------
- 9) 一键开启 BBR + fq
-10) 安装 Fail2ban
-11) 更新 sing-box
-12) 更新 sscodex 脚本
-13) 卸载 SS Codex
-14) 一键自检
-15) 查看端口与安全组建议
-16) 查看三网回程
+ 检查工具
+ 9) 一键自检
+10) 查看端口与安全组建议
+11) 查看三网回程
+----------------------------------------
+ 系统优化
+12) 一键开启 BBR + fq
+13) 安装 Fail2ban
+----------------------------------------
+ 更新维护
+14) 更新 sing-box
+15) 更新 sscodex 脚本
+----------------------------------------
+ 危险操作
+16) 卸载 SS Codex
  0) 退出
 ========================================
 EOF
@@ -1556,14 +1591,14 @@ main_loop() {
             6) restart_service_action; pause ;;
             7) show_service_status; pause ;;
             8) show_logs ;;
-            9) enable_bbr_fq; pause ;;
-            10) install_fail2ban; pause ;;
-            11) update_singbox; pause ;;
-            12) update_sscodex; pause ;;
-            13) uninstall_all; pause ;;
-            14) run_self_check; pause ;;
-            15) show_ports_security_group; pause ;;
-            16) show_backtrace_routes; pause ;;
+            9) run_self_check; pause ;;
+            10) show_ports_security_group; pause ;;
+            11) show_backtrace_routes; pause ;;
+            12) enable_bbr_fq; pause ;;
+            13) install_fail2ban; pause ;;
+            14) update_singbox; pause ;;
+            15) update_sscodex; pause ;;
+            16) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
