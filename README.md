@@ -56,7 +56,7 @@ vpsbox
 11) 一键开启 BBR + fq
 12) 安装 Fail2ban
 13) 限制 systemd 日志大小
-14) 修改 IPv4 DNS
+14) 修改系统 IPv4 DNS
 ----------------------------------------
  更新维护
 15) 更新 sing-box
@@ -87,8 +87,9 @@ vpsbox
 - 一键开启 BBR + fq
 - 安装 Fail2ban
 - 限制 systemd 日志大小
-- 修改 IPv4 DNS
+- 修改系统 IPv4 DNS
 - 更新 sing-box
 - 更新 vpsbox 脚本
+- 打开管理面板时自动检查并更新 vpsbox
 - 卸载 VPSBox
 - 可单独确认删除 sing-box 和所有节点配置

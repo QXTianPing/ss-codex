@@ -3,14 +3,16 @@ set -euo pipefail
 
 APP_NAME="VPSBox"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+SINGBOX_INSTALL_URL="https://sing-box.app/install.sh"
 CMD_PATH="/usr/local/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 STATE_FILE="$CONFIG_DIR/vpsbox.env"
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
-LOCK_FILE="/var/lock/vpsbox.lock"
-LOCK_DIR="/tmp/vpsbox.lock"
+RUNTIME_DIR="/run/vpsbox"
+LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
+LOCK_DIR="$RUNTIME_DIR/lockdir"
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -31,6 +33,32 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
+retry() {
+    local max="$1"
+    local delay="$2"
+    local attempt=1
+    local status=0
+
+    shift 2
+
+    while [ "$attempt" -le "$max" ]; do
+        if "$@"; then
+            return 0
+        else
+            status=$?
+        fi
+
+        if [ "$attempt" -ge "$max" ]; then
+            err "命令重试 ${max} 次后仍失败：$*"
+            return "$status"
+        fi
+
+        warn "命令失败，${delay} 秒后重试（${attempt}/${max}）：$*"
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
 pause() {
     echo ""
     read -r -p "按回车返回主菜单..." _
@@ -43,9 +71,25 @@ need_root() {
     fi
 }
 
+prepare_runtime_dir() {
+    if [ -L "$RUNTIME_DIR" ]; then
+        err "$RUNTIME_DIR 是符号链接，已拒绝使用。"
+        exit 1
+    fi
+
+    if ! mkdir -p "$RUNTIME_DIR"; then
+        err "无法创建运行目录：$RUNTIME_DIR"
+        exit 1
+    fi
+
+    chown root:root "$RUNTIME_DIR" 2>/dev/null || true
+    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+}
+
 acquire_lock() {
+    prepare_runtime_dir
+
     if command -v flock >/dev/null 2>&1; then
-        mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
         exec 200>"$LOCK_FILE"
         if ! flock -n 200; then
             err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
@@ -121,7 +165,7 @@ download_vpsbox_script() {
         : > "$tmp"
     fi
 
-    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+    if ! retry 3 2 curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
         rm -f "$tmp"
         err "下载失败，请检查网络或 GitHub raw 地址。"
         return 1
@@ -135,6 +179,95 @@ download_vpsbox_script() {
 
     chmod 755 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$dest"
+}
+
+auto_update_vpsbox_on_start() {
+    local src
+    local current_path
+    local installed_path
+    local tmp
+    local attempt
+    local cmd_dir
+
+    [ -t 0 ] && [ -t 1 ] || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+
+    src="${BASH_SOURCE[0]:-$0}"
+    current_path="$(readlink -f "$src" 2>/dev/null || printf '%s\n' "$src")"
+    installed_path="$(readlink -f "$CMD_PATH" 2>/dev/null || printf '%s\n' "$CMD_PATH")"
+    [ "$current_path" = "$installed_path" ] || return 0
+    [ -f "$CMD_PATH" ] || return 0
+
+    cmd_dir="$(dirname "$CMD_PATH")"
+    if command -v mktemp >/dev/null 2>&1; then
+        tmp="$(mktemp "${cmd_dir}/.vpsbox.autoupdate.XXXXXX")" || return 0
+    else
+        tmp="${cmd_dir}/.vpsbox.autoupdate.$$"
+        : > "$tmp" || return 0
+    fi
+
+    for attempt in 1 2; do
+        if curl -fsSL --connect-timeout 5 --max-time 20 "$SCRIPT_URL" -o "$tmp" >/dev/null 2>&1; then
+            break
+        fi
+
+        [ "$attempt" -eq 2 ] && { rm -f "$tmp"; return 0; }
+        sleep 1
+    done
+
+    if ! bash -n "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if cmp -s "$tmp" "$CMD_PATH"; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    info "检测到 vpsbox 新版本，正在自动更新..."
+    chmod 755 "$tmp" 2>/dev/null || true
+    if mv -f "$tmp" "$CMD_PATH"; then
+        install_command_alias
+        info "vpsbox 已更新，正在重新打开管理面板..."
+        exec "$CMD_PATH"
+    fi
+
+    rm -f "$tmp"
+    warn "vpsbox 自动更新失败，将继续使用当前版本。"
+}
+
+run_singbox_installer() {
+    local tmp
+
+    ensure_curl || return 1
+
+    if command -v mktemp >/dev/null 2>&1; then
+        tmp="$(mktemp /tmp/vpsbox-sing-box-install.XXXXXX)"
+    else
+        tmp="/tmp/vpsbox-sing-box-install.$$"
+        : > "$tmp"
+    fi
+
+    if ! retry 3 2 curl -fsSL "$SINGBOX_INSTALL_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        err "sing-box 安装脚本下载失败，请检查网络或官方安装地址。"
+        return 1
+    fi
+
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        err "sing-box 安装脚本未通过语法检查，已取消执行。"
+        return 1
+    fi
+
+    if ! bash "$tmp"; then
+        rm -f "$tmp"
+        err "sing-box 安装脚本执行失败。"
+        return 1
+    fi
+
+    rm -f "$tmp"
 }
 
 install_self_command() {
@@ -174,19 +307,19 @@ install_deps() {
 
     case "$OS" in
         alpine)
-            apk update
-            apk add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils
+            retry 3 2 apk update
+            retry 3 2 apk add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y
-            apt-get install -y curl ca-certificates openssl jq iproute2 coreutils
+            retry 3 2 apt-get update -y
+            retry 3 2 apt-get install -y curl ca-certificates openssl jq iproute2 coreutils
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y curl ca-certificates openssl jq iproute coreutils
+                retry 3 2 dnf install -y curl ca-certificates openssl jq iproute coreutils
             else
-                yum install -y curl ca-certificates openssl jq iproute coreutils
+                retry 3 2 yum install -y curl ca-certificates openssl jq iproute coreutils
             fi
             ;;
         *)
@@ -218,11 +351,10 @@ install_singbox_if_missing() {
 
     case "$OS" in
         alpine)
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
+            retry 3 2 apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
             ;;
         *)
-            ensure_curl || exit 1
-            bash <(curl -fsSL https://sing-box.app/install.sh)
+            run_singbox_installer || exit 1
             ;;
     esac
 
@@ -236,9 +368,9 @@ install_singbox_if_missing() {
 
 service_start() {
     if is_systemd; then
-        systemctl start "$SERVICE_NAME"
+        retry 3 2 systemctl start "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" start
+        retry 3 2 rc-service "$SERVICE_NAME" start
     else
         err "未检测到 systemd/OpenRC，无法管理服务。"
         return 1
@@ -247,9 +379,9 @@ service_start() {
 
 service_stop() {
     if is_systemd; then
-        systemctl stop "$SERVICE_NAME"
+        retry 3 2 systemctl stop "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" stop
+        retry 3 2 rc-service "$SERVICE_NAME" stop
     else
         err "未检测到 systemd/OpenRC，无法管理服务。"
         return 1
@@ -258,9 +390,9 @@ service_stop() {
 
 service_restart() {
     if is_systemd; then
-        systemctl restart "$SERVICE_NAME"
+        retry 3 2 systemctl restart "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" restart
+        retry 3 2 rc-service "$SERVICE_NAME" restart
     else
         err "未检测到 systemd/OpenRC，无法管理服务。"
         return 1
@@ -720,6 +852,38 @@ port_in_use() {
     ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
 }
 
+ipv6_listen_available() {
+    [ -r /proc/net/if_inet6 ] || return 1
+    [ -s /proc/net/if_inet6 ] || return 1
+
+    if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] &&
+        [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
+        return 1
+    fi
+}
+
+ipv6_bindv6only_value() {
+    local value
+
+    value="$(sysctl -n net.ipv6.bindv6only 2>/dev/null || cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)"
+    case "$value" in
+        1) echo "1" ;;
+        *) echo "0" ;;
+    esac
+}
+
+listen_mode() {
+    if ipv6_listen_available; then
+        if [ "$(ipv6_bindv6only_value)" = "1" ]; then
+            echo "dual"
+        else
+            echo "ipv6"
+        fi
+    else
+        echo "ipv4"
+    fi
+}
+
 random_port() {
     local port
     local i
@@ -742,15 +906,49 @@ random_password() {
     head -c 16 /dev/urandom | base64 | tr -d '\n\r'
 }
 
+write_shadowsocks_inbound_json() {
+    local tag="$1"
+    local listen="$2"
+    local port="$3"
+    local password="$4"
+    local suffix="${5:-}"
+
+    cat <<EOF
+    {
+      "type": "shadowsocks",
+      "tag": "$tag",
+      "listen": "$listen",
+      "listen_port": $port,
+      "method": "$METHOD",
+      "password": "$password"
+    }$suffix
+EOF
+}
+
 write_config() {
     local port="$1"
     local password="$2"
+    local mode
 
     secure_config_dir
     if [ -f "$CONFIG_PATH" ]; then
         cp "$CONFIG_PATH" "${CONFIG_PATH}.bak" 2>/dev/null || true
         chmod 600 "${CONFIG_PATH}.bak" 2>/dev/null || true
     fi
+
+    mode="$(listen_mode)"
+
+    case "$mode" in
+        ipv6)
+            info "监听地址：::（IPv4/IPv6 双栈）"
+            ;;
+        dual)
+            info "监听地址：0.0.0.0 + ::（系统启用了 IPv6-only 监听）"
+            ;;
+        *)
+            info "监听地址：0.0.0.0"
+            ;;
+    esac
 
     cat > "$CONFIG_PATH" <<EOF
 {
@@ -759,14 +957,21 @@ write_config() {
     "timestamp": true
   },
   "inbounds": [
-    {
-      "type": "shadowsocks",
-      "tag": "vpsbox-in",
-      "listen": "0.0.0.0",
-      "listen_port": $port,
-      "method": "$METHOD",
-      "password": "$password"
-    }
+EOF
+    case "$mode" in
+        ipv6)
+            write_shadowsocks_inbound_json "vpsbox-in" "::" "$port" "$password" >> "$CONFIG_PATH"
+            ;;
+        dual)
+            write_shadowsocks_inbound_json "vpsbox-in-ipv4" "0.0.0.0" "$port" "$password" "," >> "$CONFIG_PATH"
+            write_shadowsocks_inbound_json "vpsbox-in-ipv6" "::" "$port" "$password" >> "$CONFIG_PATH"
+            ;;
+        *)
+            write_shadowsocks_inbound_json "vpsbox-in" "0.0.0.0" "$port" "$password" >> "$CONFIG_PATH"
+            ;;
+    esac
+
+    cat >> "$CONFIG_PATH" <<EOF
   ],
   "outbounds": [
     {
@@ -801,13 +1006,18 @@ ExecStart=$bin run -c $CONFIG_PATH
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
+        retry 3 2 systemctl daemon-reload || return 1
         service_enable
+        return 0
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
         cat > /etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
@@ -826,11 +1036,12 @@ depend() {
     need net
 }
 EOF
-        chmod +x /etc/init.d/sing-box
+        chmod +x /etc/init.d/sing-box || return 1
         service_enable
+        return 0
     else
         err "未检测到 systemd/OpenRC，无法创建服务。"
-        exit 1
+        return 1
     fi
 }
 
@@ -957,13 +1168,16 @@ delete_node() {
 
 update_singbox() {
     install_deps
-    ensure_curl || return 1
     info "正在更新 sing-box..."
-    bash <(curl -fsSL https://sing-box.app/install.sh)
+    run_singbox_installer || return 1
 
     if node_exists; then
-        setup_service
-        service_restart
+        if ! sing-box check -c "$CONFIG_PATH" >/dev/null; then
+            err "当前节点配置未通过新版 sing-box 检查，已跳过重启。"
+            return 1
+        fi
+        setup_service || return 1
+        service_restart || return 1
     fi
 
     info "更新完成：$(singbox_version)"
@@ -1096,7 +1310,37 @@ print_ipv4_dns_from_resolv_conf() {
     return "$found"
 }
 
+resolv_conf_managed_by_systemd_resolved() {
+    [ -L /etc/resolv.conf ] || return 1
+
+    local target
+    target="$(readlink /etc/resolv.conf 2>/dev/null || true)"
+
+    case "$target" in
+        *systemd/resolve*)
+            command -v systemctl >/dev/null 2>&1 || return 1
+            systemctl list-unit-files systemd-resolved.service 2>/dev/null |
+                grep -q '^systemd-resolved\.service' || return 1
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 ipv4_dns_lines() {
+    if resolv_conf_managed_by_systemd_resolved; then
+        if print_ipv4_dns_from_resolvectl; then
+            return 0
+        fi
+        if print_ipv4_dns_from_resolv_conf; then
+            return 0
+        fi
+        echo " 未检测到 IPv4 DNS"
+        return
+    fi
+
     if print_ipv4_dns_from_resolv_conf; then
         return 0
     fi
@@ -1108,15 +1352,131 @@ ipv4_dns_lines() {
     echo " 未检测到 IPv4 DNS"
 }
 
+dns_values_line() {
+    local dns1="$1"
+    local dns2="${2:-}"
+
+    if [ -n "$dns2" ]; then
+        printf '%s %s\n' "$dns1" "$dns2"
+    else
+        printf '%s\n' "$dns1"
+    fi
+}
+
+write_resolv_conf_dns() {
+    local dns1="$1"
+    local dns2="${2:-}"
+    local backup
+
+    backup="/etc/resolv.conf.vpsbox.bak.$(date +%Y%m%d%H%M%S)"
+    if [ -e /etc/resolv.conf ]; then
+        cp /etc/resolv.conf "$backup" 2>/dev/null || warn "备份 /etc/resolv.conf 失败，将继续尝试写入。"
+    fi
+
+    if ! {
+        printf 'nameserver %s\n' "$dns1"
+        [ -n "$dns2" ] && printf 'nameserver %s\n' "$dns2"
+    } > /etc/resolv.conf; then
+        err "写入 /etc/resolv.conf 失败。"
+        return 1
+    fi
+
+    [ -e "$backup" ] && info "原配置备份：$backup"
+}
+
+rollback_systemd_resolved_dns() {
+    local conf_file="$1"
+    local backup="$2"
+    local created_conf="$3"
+
+    if [ -n "$backup" ] && [ -e "$backup" ]; then
+        if cp "$backup" "$conf_file" 2>/dev/null; then
+            warn "已恢复 systemd-resolved DNS 备份：$backup"
+        else
+            warn "恢复 systemd-resolved DNS 备份失败，请手动检查：$backup"
+        fi
+    elif [ "$created_conf" = "1" ]; then
+        rm -f "$conf_file"
+        warn "已删除新建的 systemd-resolved DNS 配置：$conf_file"
+    else
+        warn "未找到可恢复的 systemd-resolved DNS 备份，请手动检查：$conf_file"
+    fi
+}
+
+write_systemd_resolved_dns() {
+    local dns1="$1"
+    local dns2="${2:-}"
+    local conf_dir="/etc/systemd/resolved.conf.d"
+    local conf_file="$conf_dir/vpsbox.conf"
+    local backup=""
+    local created_conf="0"
+
+    mkdir -p "$conf_dir"
+    if [ -e "$conf_file" ]; then
+        backup="${conf_file}.bak.$(date +%Y%m%d%H%M%S)"
+        if ! cp "$conf_file" "$backup" 2>/dev/null; then
+            warn "备份 $conf_file 失败，将继续尝试写入。"
+            backup=""
+        fi
+    else
+        created_conf="1"
+    fi
+
+    if ! cat > "$conf_file" <<EOF
+[Resolve]
+DNS=$(dns_values_line "$dns1" "$dns2")
+Domains=~.
+EOF
+    then
+        err "写入 $conf_file 失败。"
+        rollback_systemd_resolved_dns "$conf_file" "$backup" "$created_conf"
+        return 1
+    fi
+
+    info "检测到 systemd-resolved，已写入：$conf_file"
+    info "正在重启 systemd-resolved 以应用 DNS，不会重启 VPS..."
+    if ! retry 3 2 systemctl restart systemd-resolved; then
+        err "重启 systemd-resolved 失败，请检查 systemctl status systemd-resolved --no-pager。"
+        rollback_systemd_resolved_dns "$conf_file" "$backup" "$created_conf"
+        retry 2 2 systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    resolvectl flush-caches >/dev/null 2>&1 || true
+    [ -n "$backup" ] && [ -e "$backup" ] && info "原配置备份：$backup"
+}
+
+apply_ipv4_dns() {
+    local dns1="$1"
+    local dns2="${2:-}"
+    local confirm
+
+    if resolv_conf_managed_by_systemd_resolved; then
+        write_systemd_resolved_dns "$dns1" "$dns2"
+        return $?
+    fi
+
+    if [ -L /etc/resolv.conf ]; then
+        warn "/etc/resolv.conf 是未知符号链接，DNS 可能由系统网络服务管理。"
+        read -r -p "请输入 YES 强制写入当前链接目标，其他任意输入取消：" confirm
+        if [ "$confirm" != "YES" ]; then
+            info "已取消，未修改 DNS。"
+            return 2
+        fi
+    fi
+
+    write_resolv_conf_dns "$dns1" "$dns2"
+}
+
 change_ipv4_dns() {
     local choice
     local dns1=""
     local dns2=""
-    local backup
+    local apply_status
 
     cat <<EOF
 ========================================
- 修改 IPv4 DNS
+ 修改系统 IPv4 DNS
 ========================================
 当前 IPv4 DNS：
 $(ipv4_dns_lines)
@@ -1161,26 +1521,16 @@ EOF
             ;;
     esac
 
-    if [ -L /etc/resolv.conf ]; then
-        warn "/etc/resolv.conf 是符号链接，DNS 可能由系统网络服务管理，重启后可能被覆盖。"
-    fi
-
-    backup="/etc/resolv.conf.vpsbox.bak.$(date +%Y%m%d%H%M%S)"
-    if [ -e /etc/resolv.conf ]; then
-        cp /etc/resolv.conf "$backup" 2>/dev/null || warn "备份 /etc/resolv.conf 失败，将继续尝试写入。"
-    fi
-
-    if ! {
-        printf 'nameserver %s\n' "$dns1"
-        [ -n "$dns2" ] && printf 'nameserver %s\n' "$dns2"
-    } > /etc/resolv.conf; then
-        err "写入 /etc/resolv.conf 失败。"
-        return 1
+    if apply_ipv4_dns "$dns1" "$dns2"; then
+        :
+    else
+        apply_status=$?
+        [ "$apply_status" -eq 2 ] && return 0
+        return "$apply_status"
     fi
 
     info "IPv4 DNS 已更新："
     ipv4_dns_lines
-    [ -e "$backup" ] && info "原配置备份：$backup"
 }
 
 update_system_packages() {
@@ -1206,7 +1556,9 @@ EOF
     esac
 
     export DEBIAN_FRONTEND=noninteractive
-    apt update && apt upgrade -y && apt autoremove -y
+    retry 3 2 apt update
+    retry 3 2 apt upgrade -y
+    retry 3 2 apt autoremove -y
 
     if [ "$(reboot_required_state)" = "需要" ]; then
         warn "系统更新完成，检测到需要重启 VPS。"
@@ -1251,12 +1603,14 @@ install_fail2ban() {
     case "$OS" in
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            if ! apt update || ! apt install -y fail2ban || ! systemctl enable --now fail2ban; then
+            if ! retry 3 2 apt update ||
+                ! retry 3 2 apt install -y fail2ban ||
+                ! retry 3 2 systemctl enable --now fail2ban; then
                 warn "Fail2ban 安装或启动未完全成功，将尝试写入最小 SSH 配置后重启。"
             fi
             ;;
         alpine)
-            if ! apk update || ! apk add --no-cache fail2ban; then
+            if ! retry 3 2 apk update || ! retry 3 2 apk add --no-cache fail2ban; then
                 err "Fail2ban 安装失败。"
                 return 1
             fi
@@ -1264,17 +1618,17 @@ install_fail2ban() {
                 rc-update add fail2ban default >/dev/null 2>&1 || true
             fi
             if command -v rc-service >/dev/null 2>&1; then
-                rc-service fail2ban start || true
+                retry 3 2 rc-service fail2ban start || true
             fi
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                retry 3 2 dnf install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
             else
-                yum install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                retry 3 2 yum install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
             fi
             if is_systemd; then
-                systemctl enable --now fail2ban || true
+                retry 3 2 systemctl enable --now fail2ban || true
             fi
             ;;
         *)
@@ -1306,9 +1660,9 @@ backend = systemd
 EOF
 
     if is_systemd; then
-        systemctl restart fail2ban || { err "Fail2ban 重启失败，请执行 journalctl -u fail2ban -n 50 --no-pager 查看原因。"; return 1; }
+        retry 3 2 systemctl restart fail2ban || { err "Fail2ban 重启失败，请执行 journalctl -u fail2ban -n 50 --no-pager 查看原因。"; return 1; }
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        rc-service fail2ban restart || { err "Fail2ban 重启失败。"; return 1; }
+        retry 3 2 rc-service fail2ban restart || { err "Fail2ban 重启失败。"; return 1; }
     fi
 
     info "等待 Fail2ban 服务重启 3 秒..."
@@ -1464,11 +1818,33 @@ ensure_nexttrace() {
 
     ensure_curl || return 1
 
+    local tmp
+    if command -v mktemp >/dev/null 2>&1; then
+        tmp="$(mktemp /tmp/vpsbox-nexttrace-install.XXXXXX)"
+    else
+        tmp="/tmp/vpsbox-nexttrace-install.$$"
+        : > "$tmp"
+    fi
+
     info "正在安装 nexttrace..."
-    if ! curl -fsSL https://nxtrace.org/nt | bash; then
+    if ! retry 3 2 curl -fsSL https://nxtrace.org/nt -o "$tmp"; then
+        rm -f "$tmp"
+        err "nexttrace 安装脚本下载失败，请检查网络后重试。"
+        return 1
+    fi
+
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        err "nexttrace 安装脚本未通过语法检查，已取消执行。"
+        return 1
+    fi
+
+    if ! bash "$tmp"; then
+        rm -f "$tmp"
         err "nexttrace 安装失败，请检查网络后重试。"
         return 1
     fi
+    rm -f "$tmp"
 
     if nexttrace_installed; then
         info "nexttrace 安装完成。"
@@ -1764,13 +2140,13 @@ limit_systemd_journal() {
     fi
 
     info "正在清理 systemd 日志，仅保留最新 500M..."
-    journalctl --vacuum-size=500M
+    retry 3 2 journalctl --vacuum-size=500M
 
     info "正在设置日志限制：总大小 500M，单文件 50M..."
     set_journald_conf_value SystemMaxUse 500M
     set_journald_conf_value SystemMaxFileSize 50M
 
-    systemctl restart systemd-journald
+    retry 3 2 systemctl restart systemd-journald
     info "systemd 日志限制已设置。"
     info "当前日志占用：$(journal_disk_usage)"
     info "总大小：500M"
@@ -1844,7 +2220,7 @@ $(ipv4_dns_lines)
 11) 一键开启 BBR + fq
 12) 安装 Fail2ban
 13) 限制 systemd 日志大小
-14) 修改 IPv4 DNS
+14) 修改系统 IPv4 DNS
 ----------------------------------------
  更新维护
 15) 更新 sing-box
@@ -1890,4 +2266,5 @@ need_root
 detect_os
 acquire_lock
 install_self_command
+auto_update_vpsbox_on_start
 main_loop
