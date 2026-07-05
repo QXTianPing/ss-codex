@@ -1705,6 +1705,11 @@ resolve_host_ips() {
 run_self_check() {
     detect_os
     local has_node="0"
+    local max_use
+    local max_file
+
+    max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
+    max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
 
     cat <<EOF
 ========================================
@@ -1790,6 +1795,8 @@ EOF
         check_warn "公网 IPv4" "获取失败"
     fi
 
+    check_ok "系统时间" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    check_ok "运行时间" "$(uptime -p 2>/dev/null || echo "无法检测")"
     check_ok "BBR" "$(bbr_state)"
     check_ok "fq" "$(fq_state)"
     check_ok "Fail2ban" "$(fail2ban_install_state)"
@@ -1803,10 +1810,14 @@ EOF
     fi
     check_ok "日志占用" "$(journal_disk_usage)"
     check_ok "日志限制" "$(journald_limit_state)"
+    check_ok "日志最大占用" "$max_use"
+    check_ok "单个日志最大" "$max_file"
 
     cat <<EOF
 ========================================
 EOF
+
+    show_ports_security_group || true
 }
 
 nexttrace_installed() {
@@ -2159,36 +2170,6 @@ limit_systemd_journal() {
     info "单文件：50M"
 }
 
-show_system_maintenance_status() {
-    local max_use
-    local max_file
-
-    max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
-    max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
-
-    cat <<EOF
-========================================
- 系统优化状态
-========================================
- 系统时间：$(date '+%Y-%m-%d %H:%M:%S %Z')
- 运行时间：$(uptime -p 2>/dev/null || echo "无法检测")
- 系统重启：$(reboot_required_state)
-
- BBR：$(bbr_state)
- fq：$(fq_state)
- Fail2ban：$(fail2ban_service_state)
- SSH 防护：$(fail2ban_sshd_state)
-
- systemd 日志占用：$(journal_disk_usage)
- systemd 日志限制：$(journald_limit_state)
- 日志最大占用：$max_use
- 单个日志最大：$max_file
-========================================
-EOF
-
-    show_ports_security_group || true
-}
-
 show_menu() {
     clear 2>/dev/null || true
     cat <<EOF
@@ -2206,36 +2187,120 @@ show_menu() {
  IPv4 DNS：
 $(ipv4_dns_lines)
 ----------------------------------------
- 节点管理
- 1) 创建/重建 SS 2022 节点
- 2) 查看节点链接
- 3) 删除当前节点
+ 1) 节点管理
+ 2) sing-box 管理
+ 3) 系统优化
+ 4) 一键自检
+ 5) 查看三网回程
 ----------------------------------------
- 服务管理
- 4) 启动 sing-box 服务
- 5) 停止 sing-box 服务
- 6) 重启 sing-box 服务
-----------------------------------------
- 检查工具
- 7) 一键自检
- 8) 查看三网回程
- 9) 查看系统优化状态
-----------------------------------------
- 系统优化
-10) 系统更新
-11) 一键开启 BBR + fq
-12) 安装 Fail2ban
-13) 限制 systemd 日志大小
-14) 修改系统 IPv4 DNS
-----------------------------------------
- 更新维护
-15) 更新 sing-box
-16) 更新 vpsbox 脚本
-----------------------------------------
-17) 卸载 VPSBox
+ 8) 更新 vpsbox 脚本
+ 9) 卸载 VPSBox
  0) 退出
 ========================================
 EOF
+}
+
+node_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ 节点管理
+========================================
+ 当前节点：$(node_state)
+ 节点地址：$(node_address)
+----------------------------------------
+ 1) 创建/重建 SS 2022 节点
+ 2) 查看节点链接
+ 3) 删除当前节点
+ 0) 返回主菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt
+        echo ""
+
+        case "$opt" in
+            1) create_or_rebuild_node; pause ;;
+            2) view_node_link; pause ;;
+            3) delete_node; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
+singbox_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ sing-box 管理
+========================================
+ sing-box：$(singbox_install_state)
+ sing-box 状态：$(service_status_short)
+ sing-box 版本：$(singbox_version)
+----------------------------------------
+ 1) 启动 sing-box 服务
+ 2) 停止 sing-box 服务
+ 3) 重启 sing-box 服务
+ 4) 更新 sing-box
+ 0) 返回主菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt
+        echo ""
+
+        case "$opt" in
+            1) start_service_action; pause ;;
+            2) service_stop && info "sing-box 服务已停止。"; pause ;;
+            3) restart_service_action; pause ;;
+            4) update_singbox; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
+system_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ 系统优化
+========================================
+ BBR：$(bbr_state)
+ fq：$(fq_state)
+ Fail2ban：$(fail2ban_service_state)
+ SSH 防护：$(fail2ban_sshd_state)
+ 系统重启：$(reboot_required_state)
+----------------------------------------
+ 1) 系统更新
+ 2) 一键开启 BBR + fq
+ 3) 安装 Fail2ban
+ 4) 限制 systemd 日志大小
+ 5) 修改系统 IPv4 DNS
+ 0) 返回主菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt
+        echo ""
+
+        case "$opt" in
+            1) update_system_packages; pause ;;
+            2) enable_bbr_fq; pause ;;
+            3) install_fail2ban; pause ;;
+            4) limit_systemd_journal; pause ;;
+            5) change_ipv4_dns; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
 }
 
 main_loop() {
@@ -2245,23 +2310,13 @@ main_loop() {
         echo ""
 
         case "$opt" in
-            1) create_or_rebuild_node; pause ;;
-            2) view_node_link; pause ;;
-            3) delete_node; pause ;;
-            4) start_service_action; pause ;;
-            5) service_stop && info "sing-box 服务已停止。"; pause ;;
-            6) restart_service_action; pause ;;
-            7) run_self_check; pause ;;
-            8) show_backtrace_routes; pause ;;
-            9) show_system_maintenance_status; pause ;;
-            10) update_system_packages; pause ;;
-            11) enable_bbr_fq; pause ;;
-            12) install_fail2ban; pause ;;
-            13) limit_systemd_journal; pause ;;
-            14) change_ipv4_dns; pause ;;
-            15) update_singbox; pause ;;
-            16) update_vpsbox; pause ;;
-            17) uninstall_all; pause ;;
+            1) node_menu ;;
+            2) singbox_menu ;;
+            3) system_menu ;;
+            4) run_self_check; pause ;;
+            5) show_backtrace_routes; pause ;;
+            8) update_vpsbox; pause ;;
+            9) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
