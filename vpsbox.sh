@@ -1722,16 +1722,34 @@ EOF
     info "SSH 防护：$(fail2ban_sshd_state)"
 }
 
+check_table_header() {
+    cat <<'EOF'
+----------------------------------------
+ 状态   | 项目             | 结果
+--------+------------------+------------
+EOF
+}
+
+check_table_footer() {
+    cat <<'EOF'
+--------+------------------+------------
+EOF
+}
+
+check_row() {
+    printf ' %-6s | %-16s | %s\n' "$1" "$2" "${3:-}"
+}
+
 check_ok() {
-    printf '[OK]   %-18s %s\n' "$1" "${2:-}"
+    check_row "OK" "$1" "${2:-}"
 }
 
 check_warn() {
-    printf '[WARN] %-18s %s\n' "$1" "${2:-}"
+    check_row "WARN" "$1" "${2:-}"
 }
 
 check_fail() {
-    printf '[FAIL] %-18s %s\n' "$1" "${2:-}"
+    check_row "FAIL" "$1" "${2:-}"
 }
 
 public_ipv4() {
@@ -1760,6 +1778,7 @@ run_self_check() {
  一键自检
 ========================================
 EOF
+    check_table_header
 
     if [ "$(id -u)" = "0" ]; then
         check_ok "运行用户" "root"
@@ -1858,9 +1877,7 @@ EOF
     check_ok "日志最大占用" "$max_use"
     check_ok "单个日志最大" "$max_file"
 
-    cat <<EOF
-========================================
-EOF
+    check_table_footer
 
     show_ports_security_group || true
 }
