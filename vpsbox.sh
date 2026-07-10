@@ -1062,10 +1062,21 @@ load_state() {
     local reality_public_key=""
     local reality_short_id=""
     local fingerprint=""
+    local seen_keys=""
 
     state_file_is_secure || return 1
 
     while IFS='=' read -r key value; do
+        case "$key" in
+            ""|'#'*) continue ;;
+            DOMAIN|NAME|PORT|PASSWORD|METHOD|PROTOCOL|UUID|FLOW|REALITY_SERVER_NAME|REALITY_PUBLIC_KEY|REALITY_SHORT_ID|FINGERPRINT)
+                case " $seen_keys " in
+                    *" $key "*) return 1 ;;
+                esac
+                seen_keys="$seen_keys $key"
+                ;;
+            *) return 1 ;;
+        esac
         case "$key" in
             DOMAIN) domain="$value" ;;
             NAME) name="$value" ;;
@@ -1079,8 +1090,6 @@ load_state() {
             REALITY_PUBLIC_KEY) reality_public_key="$value" ;;
             REALITY_SHORT_ID) reality_short_id="$value" ;;
             FINGERPRINT) fingerprint="$value" ;;
-            ""|'#'*) ;;
-            *) return 1 ;;
         esac
     done < "$STATE_FILE"
 
@@ -1491,7 +1500,7 @@ random_port() {
     local i
     for i in $(seq 1 100); do
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if ! port_in_use "$port"; then
+        if ! port_in_use "$port" && ! port_is_effective_ssh_port "$port"; then
             echo "$port"
             return 0
         fi
