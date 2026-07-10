@@ -604,14 +604,9 @@ install_singbox_if_missing() {
     install_deps
     detect_os
 
-    case "$OS" in
-        alpine)
-            retry 3 2 apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
-            ;;
-        *)
-            run_singbox_installer || exit 1
-            ;;
-    esac
+    # Alpine 不再混用 edge/community；官方安装脚本会按 apk 架构安装对应的稳定版发布包。
+    # Debian/Ubuntu 及其他系统继续沿用原有官方安装流程。
+    run_singbox_installer || exit 1
 
     if ! singbox_installed; then
         err "sing-box 安装失败，请检查网络或手动安装。"
