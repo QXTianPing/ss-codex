@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.6"
+VPSBOX_VERSION="v1.0.7"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -43,17 +43,19 @@ PORT_MAX=60000
 TRACE_NAMES=(
     "北京电信" "北京联通" "北京移动"
     "上海电信" "上海联通" "上海移动"
-    "广州电信" "广州联通" "广州移动"
+    "广东电信" "广东联通" "广东移动"
     "安徽电信" "安徽联通" "安徽移动"
     "江苏电信" "江苏联通" "江苏移动"
 )
 TRACE_IPS=(
-    "219.141.140.10" "202.106.195.68" "221.179.155.161"
-    "101.95.120.109" "210.22.70.3" "183.192.160.3"
-    "58.60.188.222" "210.21.196.6" "120.196.165.24"
-    "117.68.25.70" "112.132.39.158" "39.145.24.48"
-    "180.102.191.98" "112.80.130.226" "36.155.201.93"
+    "106.37.68.13" "221.222.185.232" "211.136.25.153"
+    "101.226.101.195" "112.64.235.107" "117.185.117.117"
+    "183.47.102.91" "157.148.63.62" "211.139.145.129"
+    "117.68.18.76" "112.132.39.144" "39.145.24.107"
+    "117.62.242.159" "112.80.130.226" "36.155.213.87"
 )
+TRACE_REGIONS=("北京" "上海" "广东" "安徽" "江苏")
+TRACE_ISPS=("电信" "联通" "移动")
 TRACE_MAX_JOBS=3
 REMOTE_VERSION=""
 UPDATE_AVAILABLE=0
@@ -4240,13 +4242,51 @@ trace_has() {
     printf '%s\n' "$output" | grep -Eiq "$pattern"
 }
 
-trace_count() {
+trace_has_asn() {
     local output="$1"
-    local pattern="$2"
-    local count
+    local asn="$2"
 
-    count="$(printf '%s\n' "$output" | grep -Eo "$pattern" | wc -l || true)"
-    printf '%s\n' "${count//[[:space:]]/}"
+    printf '%s\n' "$output" | grep -Eiq "(^|[^[:alnum:]_])AS[[:space:]]*${asn}([^[:alnum:]_]|$)"
+}
+
+trace_hop_count() {
+    local output="$1"
+    local prefix="$2"
+
+    printf '%s\n' "$output" | awk -v prefix="$prefix" '
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            hop = line
+            sub(/[[:space:]].*$/, "", hop)
+            if (hop ~ /^[0-9]+$/ && index($0, prefix) > 0) seen[hop] = 1
+        }
+        END {
+            count = 0
+            for (hop in seen) count++
+            print count
+        }
+    '
+}
+
+trace_output_has_hop() {
+    trace_has "$1" '^[[:space:]]*[0-9]+[[:space:]].*([0-9]{1,3}\.){3}[0-9]{1,3}'
+}
+
+validate_trace_targets() {
+    local i
+    local expected=$(( ${#TRACE_REGIONS[@]} * ${#TRACE_ISPS[@]} ))
+
+    if [ "${#TRACE_NAMES[@]}" -ne "$expected" ] || [ "${#TRACE_IPS[@]}" -ne "$expected" ]; then
+        err "三网回程目标配置数量不一致。"
+        return 1
+    fi
+    for i in "${!TRACE_IPS[@]}"; do
+        if ! is_ipv4_address "${TRACE_IPS[$i]}"; then
+            err "三网回程目标 IP 无效：${TRACE_NAMES[$i]} (${TRACE_IPS[$i]})"
+            return 1
+        fi
+    done
 }
 
 detect_trace_line() {
@@ -4256,49 +4296,43 @@ detect_trace_line() {
     local count_20297=0
     local count_5943=0
 
-    trace_has "$output" 'AS[[:space:]]*4134|AS4134|202\.97\.' && has_4134=1
-    trace_has "$output" 'AS[[:space:]]*4809|AS4809|59\.43\.' && has_4809=1
-    count_20297="$(trace_count "$output" '202\.97\.')"
-    count_5943="$(trace_count "$output" '59\.43\.')"
+    (trace_has_asn "$output" 4134 || trace_has "$output" '202\.97\.') && has_4134=1
+    (trace_has_asn "$output" 4809 || trace_has "$output" '59\.43\.') && has_4809=1
+    count_20297="$(trace_hop_count "$output" '202.97.')"
+    count_5943="$(trace_hop_count "$output" '59.43.')"
 
-    if trace_has "$output" 'AS[[:space:]]*23764|AS23764|69\.194\.|203\.22\.'; then
+    if trace_has_asn "$output" 23764 || trace_has "$output" '69\.194\.|203\.22\.'; then
         echo "CTGNet|AS23764"
-    elif trace_has "$output" 'AS[[:space:]]*10099|AS10099'; then
+    elif trace_has_asn "$output" 10099; then
         echo "10099|AS10099"
-    elif trace_has "$output" 'AS[[:space:]]*58807|AS58807|223\.120\.(1(2[89]|[3-9][0-9])|2([0-4][0-9]|5[0-5]))\.'; then
+    elif trace_has_asn "$output" 58807 || trace_has "$output" '223\.120\.(1(2[89]|[3-9][0-9])|2([0-4][0-9]|5[0-5]))\.'; then
         echo "CMIN2|AS58807"
-    elif trace_has "$output" 'AS[[:space:]]*9929|AS9929|218\.105\.|210\.51\.'; then
+    elif trace_has_asn "$output" 9929 || trace_has "$output" '218\.105\.|210\.51\.'; then
         echo "9929|AS9929"
     elif [ "$has_4134" = "1" ] && [ "$has_4809" = "1" ] && [ "$count_20297" -gt 1 ]; then
         echo "CN2 GT|AS4134/AS4809"
     elif [ "$has_4809" = "1" ] && [ "$count_5943" -gt 0 ]; then
         echo "CN2 GIA|AS4809"
     elif [ "$has_4809" = "1" ]; then
-        echo "CN2（待确认）|AS4809"
+        echo "CN2待确认|AS4809"
     elif [ "$has_4134" = "1" ]; then
         echo "163|AS4134"
-    elif trace_has "$output" 'AS[[:space:]]*4837|AS4837|219\.158\.'; then
+    elif trace_has_asn "$output" 4837 || trace_has "$output" '219\.158\.'; then
         echo "4837|AS4837"
-    elif trace_has "$output" 'AS[[:space:]]*58453|AS58453|223\.(118|119|121)\.|223\.120\.(0|[1-9][0-9]|1[01][0-9]|12[0-7])\.'; then
+    elif trace_has_asn "$output" 58453 || trace_has "$output" '223\.(118|119|121)\.|223\.120\.(0|[1-9][0-9]|1[01][0-9]|12[0-7])\.'; then
         echo "CMI|AS58453"
-    elif trace_has "$output" 'AS[[:space:]]*9808|AS9808|221\.(176|183)\.'; then
+    elif trace_has_asn "$output" 9808 || trace_has "$output" '221\.(176|183)\.'; then
         echo "CMNET|AS9808"
-    elif trace_has "$output" 'AS[[:space:]]*3356|AS3356'; then
+    elif trace_has_asn "$output" 3356; then
         echo "Lumen|AS3356"
     else
-        echo "未识别|-"
+        echo "Hidden|-"
     fi
 }
 
 run_nexttrace_target() {
     local ip="$1"
-    local mode="$2"
-    local -a args=(-n -P -C)
-
-    if [ "$mode" = "tcp" ]; then
-        args+=(-T -p 443)
-    fi
-    args+=("$ip")
+    local -a args=(-n -P -C -T -p 80 "$ip")
 
     if command -v timeout >/dev/null 2>&1; then
         timeout 30 nexttrace "${args[@]}" 2>&1
@@ -4311,29 +4345,95 @@ check_route_target() {
     local name="$1"
     local ip="$2"
     local result_file="$3"
-    local mode="$4"
     local output
     local detected
     local result
     local asn
 
-    if output="$(run_nexttrace_target "$ip" "$mode")"; then
-        detected="$(detect_trace_line "$output")"
-        result="${detected%%|*}"
-        asn="${detected#*|}"
-    else
-        result="检测失败"
+    output="$(run_nexttrace_target "$ip")" || true
+    detected="$(detect_trace_line "$output")"
+    result="${detected%%|*}"
+    asn="${detected#*|}"
+    if [ "$result" = "Hidden" ] && ! trace_output_has_hop "$output"; then
+        result="Fail"
         asn="-"
     fi
 
-    printf '%-10s %-15s %-10s %s\n' "$name" "$ip" "$result" "$asn" > "$result_file"
+    printf '%s|%s|%s|%s\n' "$name" "$ip" "$result" "$asn" > "$result_file"
+}
+
+format_trace_cell() {
+    local result="$1"
+
+    case "$result" in
+        CN2待确认) printf '%s%*s' "$result" 5 "" ;;
+        *) printf '%-14s' "$result" ;;
+    esac
+}
+
+format_trace_region() {
+    printf ' %s    ' "$1"
+}
+
+show_backtrace_matrix() {
+    local tmp_dir="$1"
+    local i result_file name ip result asn region isp
+    local identified=0 hidden=0 failed=0 total="${#TRACE_NAMES[@]}"
+    local report_time
+    local -a issues=()
+    local -A results=()
+
+    report_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    for i in "${!TRACE_NAMES[@]}"; do
+        result_file="$tmp_dir/$i"
+        if [ -s "$result_file" ]; then
+            IFS='|' read -r name ip result asn < "$result_file" || true
+        else
+            name="${TRACE_NAMES[$i]}"
+            ip="${TRACE_IPS[$i]}"
+            result="Fail"
+            asn="-"
+        fi
+        results["$name"]="$result"
+        case "$result" in
+            Hidden) hidden=$((hidden + 1)); issues+=("$name|$ip|Hidden") ;;
+            Fail) failed=$((failed + 1)); issues+=("$name|$ip|Fail") ;;
+            *) identified=$((identified + 1)) ;;
+        esac
+    done
+
+    cat <<EOF
+ 报告时间：$report_time
+ 方式：TCP 80　目标：$total　并发：$TRACE_MAX_JOBS
+--------------------------------------------------------
+ 地区    电信          联通          移动
+EOF
+
+    for region in "${TRACE_REGIONS[@]}"; do
+        format_trace_region "$region"
+        for isp in "${TRACE_ISPS[@]}"; do
+            name="${region}${isp}"
+            format_trace_cell "${results["$name"]:-Fail}"
+        done
+        printf '\n'
+    done
+
+    printf '\n--------------------------------------------------------\n'
+    printf ' 结果：目标 %d | 已识别 %d | Hidden %d | Fail %d\n' "$total" "$identified" "$hidden" "$failed"
+    if [ "${#issues[@]}" -gt 0 ]; then
+        printf '\n 未识别/失败：\n'
+        for i in "${issues[@]}"; do
+            IFS='|' read -r name ip result <<< "$i"
+            printf ' %-8s %-15s %s\n' "$name" "$ip" "$result"
+        done
+    fi
 }
 
 show_backtrace_routes() {
+    validate_trace_targets || return 1
     ensure_nexttrace || return 1
 
-    local mode
-    local mode_name
     local i
     local name
     local ip
@@ -4341,15 +4441,6 @@ show_backtrace_routes() {
     local result_file
     local job_count=0
     local completed=0
-
-    while true; do
-        read -r -p "检测模式：ICMP 快速检测 / TCP 443 复核 (I/t，默认 I): " mode || return 1
-        case "$mode" in
-            ""|I|i) mode="icmp"; mode_name="ICMP 快速检测"; break ;;
-            T|t) mode="tcp"; mode_name="TCP 443 复核"; break ;;
-            *) warn "请输入 i 或 t；直接回车默认 ICMP 快速检测。" ;;
-        esac
-    done
 
     tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)" || { err "无法创建回程检测临时目录。"; return 1; }
     [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] || { err "回程检测临时目录路径异常。"; return 1; }
@@ -4359,16 +4450,14 @@ show_backtrace_routes() {
 ========================================
  三网回程检测
 ========================================
-模式：$mode_name
+模式：TCP 80
 正在分批检测 ${#TRACE_NAMES[@]} 个目标，每批最多 ${TRACE_MAX_JOBS} 个，每个最多 30 秒，请稍等...
-----------------------------------------
-线路      目标 IP          判断       关键 ASN
 EOF
 
     for i in "${!TRACE_NAMES[@]}"; do
         name="${TRACE_NAMES[$i]}"
         ip="${TRACE_IPS[$i]}"
-        check_route_target "$name" "$ip" "$tmp_dir/$i" "$mode" &
+        check_route_target "$name" "$ip" "$tmp_dir/$i" &
         job_count=$((job_count + 1))
         if [ "$job_count" -ge "$TRACE_MAX_JOBS" ]; then
             wait
@@ -4385,14 +4474,7 @@ EOF
     fi
     printf '\n'
 
-    for i in "${!TRACE_NAMES[@]}"; do
-        result_file="$tmp_dir/$i"
-        if [ -s "$result_file" ]; then
-            cat "$result_file"
-        else
-            printf '%-10s %-15s %-10s %s\n' "${TRACE_NAMES[$i]}" "${TRACE_IPS[$i]}" "检测失败" "-"
-        fi
-    done
+    show_backtrace_matrix "$tmp_dir"
 
     rm -rf "$tmp_dir"
     trap - RETURN
