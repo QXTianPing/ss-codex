@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.11"
+VPSBOX_VERSION="v1.0.12"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -5009,6 +5009,29 @@ node_address() {
     fi
 }
 
+node_summary() {
+    local protocol
+
+    if ! node_exists; then
+        cat <<EOF
+ 当前节点：未创建
+ 节点协议：-
+ 节点名称：-
+ 节点地址：-
+ 节点端口：-
+EOF
+        return 0
+    fi
+
+    case "$PROTOCOL" in
+        vless-reality) protocol="VLESS Reality" ;;
+        *) protocol="SS 2022" ;;
+    esac
+
+    printf ' 当前节点：已创建\n 节点协议：%s\n 节点名称：%s\n 节点地址：%s\n 节点端口：%s\n' \
+        "$protocol" "$NAME" "$DOMAIN" "$PORT"
+}
+
 reboot_required_state() {
     if [ -f /var/run/reboot-required ] || [ -f /run/reboot-required ]; then
         echo "需要"
@@ -5129,8 +5152,7 @@ $(vpsbox_update_notice)
  sing-box：$(singbox_install_state)
  sing-box 状态：$(service_status_short)
  sing-box 版本：$(singbox_version)
- 当前节点：$(node_state)
- 节点地址：$(node_address)
+$(node_summary)
 ----------------------------------------
  IPv4 DNS：
 $(ipv4_dns_lines)
@@ -5158,8 +5180,7 @@ node_menu() {
 ========================================
  节点管理
 ========================================
- 当前节点：$(node_state)
- 节点地址：$(node_address)
+$(node_summary)
  sing-box 状态：$(service_status_short)
 ----------------------------------------
  [1] 创建/重建 SS 2022 节点

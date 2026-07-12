@@ -2,7 +2,7 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
-当前版本：`v1.0.11`
+当前版本：`v1.0.12`
 
 ## VPS 一键安装
 
@@ -32,7 +32,10 @@ vpsbox
  sing-box 状态：运行中 / 未运行
  sing-box 版本：1.x.x
  当前节点：已创建 / 未创建
- 节点地址：example.com:49880
+ 节点协议：SS 2022 / VLESS Reality / -
+ 节点名称：ss-example
+ 节点地址：example.com
+ 节点端口：49880
 ----------------------------------------
  IPv4 DNS：
  nameserver 1.1.1.1
