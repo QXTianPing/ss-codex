@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.12"
+VPSBOX_VERSION="v1.0.13"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -36,6 +36,7 @@ LOCK_DIR="$RUNTIME_DIR/lockdir"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
 ACTIVE_NODE_BACKUP=""
+ACTIVE_TRACE_TMP=""
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -56,7 +57,9 @@ TRACE_IPS=(
 )
 TRACE_REGIONS=("北京" "上海" "广东" "安徽" "江苏")
 TRACE_ISPS=("电信" "联通" "移动")
-TRACE_MAX_JOBS=3
+TRACE_SIZE_SMALL=64
+TRACE_SIZE_LARGE=1400
+TRACE_SIZE_QUERIES=3
 REMOTE_VERSION=""
 UPDATE_AVAILABLE=0
 
@@ -216,12 +219,22 @@ cleanup_vpsbox_lock() {
     fi
 }
 
+cleanup_active_trace_tmp() {
+    local tmp_dir="${ACTIVE_TRACE_TMP:-}"
+
+    ACTIVE_TRACE_TMP=""
+    if [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
+        rm -rf -- "$tmp_dir"
+    fi
+}
+
 cleanup_vpsbox_runtime() {
     local backup="${ACTIVE_NODE_BACKUP:-}"
     ACTIVE_NODE_BACKUP=""
     if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ] && declare -F restore_node_files >/dev/null 2>&1; then
         restore_node_files "$backup" || true
     fi
+    cleanup_active_trace_tmp
     cleanup_vpsbox_lock
 }
 
@@ -4415,9 +4428,39 @@ detect_trace_line() {
     fi
 }
 
-run_nexttrace_target() {
+nexttrace_supports_size_compare() {
+    local help flag
+    local -a missing=()
+
+    help="$(nexttrace --help 2>&1 || true)"
+    if [ -z "$help" ]; then
+        err "无法读取 nexttrace 参数列表。"
+        return 1
+    fi
+
+    for flag in --psize --source-port --parallel-requests --queries; do
+        grep -Fq -e "$flag" <<< "$help" || missing+=("$flag")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        err "当前 nexttrace 不支持大小包对比所需参数：${missing[*]}"
+        err "请更新 nexttrace 后重试；vpsbox 不会覆盖已有的外部安装。"
+        return 1
+    fi
+    return 0
+}
+
+run_nexttrace_sized_target() {
     local ip="$1"
-    local -a args=(-n -P -C -T -p 80 "$ip")
+    local source_port="$2"
+    local packet_size="$3"
+    local -a args=(
+        -n -P -C -T -p 80
+        --source-port "$source_port"
+        --parallel-requests 1
+        --queries "$TRACE_SIZE_QUERIES"
+        --psize "$packet_size"
+        "$ip"
+    )
 
     if command -v timeout >/dev/null 2>&1; then
         timeout 30 nexttrace "${args[@]}" 2>&1
@@ -4426,16 +4469,128 @@ run_nexttrace_target() {
     fi
 }
 
-check_route_target() {
+trace_asn_path_file() {
+    local output_file="$1"
+
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            hop = line
+            sub(/[[:space:]].*$/, "", hop)
+            if (hop !~ /^[0-9]+$/) next
+
+            while (match(line, /AS[[:space:]]*[0-9]+/)) {
+                asn = substr(line, RSTART, RLENGTH)
+                gsub(/[^0-9]/, "", asn)
+                if (asn != "" && asn != "0" && asn != last) {
+                    if (path != "") path = path ">"
+                    path = path asn
+                    last = asn
+                }
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+        END { print path }
+    ' "$output_file"
+}
+
+trace_file_has_hop() {
+    grep -Eq '^[[:space:]]*[0-9]+[[:space:]].*([0-9]{1,3}\.){3}[0-9]{1,3}' "$1"
+}
+
+trace_asn_label() {
+    case "$1" in
+        4134) printf '163' ;;
+        4809) printf 'CN2' ;;
+        23764) printf 'CTGNet' ;;
+        10099) printf '10099' ;;
+        9929) printf '9929' ;;
+        4837) printf '4837' ;;
+        58807) printf 'CMIN2' ;;
+        58453) printf 'CMI' ;;
+        9808) printf 'CMNET' ;;
+        3356) printf 'Lumen' ;;
+        *) printf 'AS%s' "$1" ;;
+    esac
+}
+
+trace_asn_path_display() {
+    local path="$1"
+    local asn label output="" last_label=""
+    local -a asns=()
+
+    if [ -z "$path" ]; then
+        printf '-'
+        return 0
+    fi
+
+    IFS='>' read -r -a asns <<< "$path"
+    for asn in "${asns[@]}"; do
+        [ -n "$asn" ] || continue
+        label="$(trace_asn_label "$asn")"
+        [ "$label" = "$last_label" ] && continue
+        if [ -n "$output" ]; then
+            output+=" → "
+        fi
+        output+="$label"
+        last_label="$label"
+    done
+    printf '%s' "${output:--}"
+}
+
+capture_size_trace() {
+    local ip="$1"
+    local source_port="$2"
+    local packet_size="$3"
+    local output_file="$4"
+    local path
+
+    if ! : > "$output_file"; then
+        err "无法创建大小包探测临时文件：$output_file"
+        return 1
+    fi
+    if ! run_nexttrace_sized_target "$ip" "$source_port" "$packet_size" > "$output_file"; then
+        :
+    fi
+
+    if ! trace_file_has_hop "$output_file"; then
+        printf 'fail|\n'
+        return 0
+    fi
+
+    path="$(trace_asn_path_file "$output_file")"
+    if [ -n "$path" ]; then
+        printf 'ok|%s\n' "$path"
+    else
+        printf 'no-asn|\n'
+    fi
+}
+
+size_trace_path_display() {
+    local state="$1"
+    local path="$2"
+
+    case "$state" in
+        ok) trace_asn_path_display "$path" ;;
+        no-asn) printf '无 ASN' ;;
+        *) printf '失败' ;;
+    esac
+}
+
+write_route_result_from_trace_file() {
     local name="$1"
     local ip="$2"
-    local result_file="$3"
-    local output
-    local detected
-    local result
-    local asn
+    local output_file="$3"
+    local result_file="$4"
+    local output detected result asn
 
-    output="$(run_nexttrace_target "$ip")" || true
+    if [ ! -f "$output_file" ]; then
+        err "三网回程探测输出不存在：$output_file"
+        return 1
+    fi
+
+    output="$(<"$output_file")"
     detected="$(detect_trace_line "$output")"
     result="${detected%%|*}"
     asn="${detected#*|}"
@@ -4445,6 +4600,121 @@ check_route_target() {
     fi
 
     printf '%s|%s|%s|%s\n' "$name" "$ip" "$result" "$asn" > "$result_file"
+}
+
+check_combined_route_target() {
+    local name="$1"
+    local ip="$2"
+    local source_port="$3"
+    local file_prefix="$4"
+    local route_result_file="$5"
+    local size_result_file="$6"
+    local small1 large1 small2 large2
+    local small1_state large1_state small2_state="" large2_state=""
+    local small1_path large1_path small2_path="" large2_path=""
+    local small_display large_display status
+
+    small1="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_SMALL" "${file_prefix}.small1")" || return 1
+    small1_state="${small1%%|*}"
+    small1_path="${small1#*|}"
+    write_route_result_from_trace_file "$name" "$ip" "${file_prefix}.small1" "$route_result_file" || return 1
+
+    large1="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_LARGE" "${file_prefix}.large1")" || return 1
+    large1_state="${large1%%|*}"
+    large1_path="${large1#*|}"
+
+    if [ "$small1_state" = "fail" ] || [ "$large1_state" = "fail" ]; then
+        status="Fail"
+    elif [ "$small1_state" != "ok" ] || [ "$large1_state" != "ok" ]; then
+        status="Unknown"
+    elif [ "$small1_path" = "$large1_path" ]; then
+        status="Same"
+    else
+        printf '          首轮路径不同，正在执行 %s B → %s B 复测...\n' "$TRACE_SIZE_LARGE" "$TRACE_SIZE_SMALL"
+        large2="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_LARGE" "${file_prefix}.large2")" || return 1
+        large2_state="${large2%%|*}"
+        large2_path="${large2#*|}"
+
+        small2="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_SMALL" "${file_prefix}.small2")" || return 1
+        small2_state="${small2%%|*}"
+        small2_path="${small2#*|}"
+
+        if [ "$small2_state" != "ok" ] || [ "$large2_state" != "ok" ]; then
+            status="Unknown"
+        elif [ "$small1_path" = "$small2_path" ] && [ "$large1_path" = "$large2_path" ] && [ "$small1_path" != "$large1_path" ]; then
+            status="Split"
+        else
+            status="Fluctuation"
+        fi
+    fi
+
+    small_display="$(size_trace_path_display "$small1_state" "$small1_path")"
+    large_display="$(size_trace_path_display "$large1_state" "$large1_path")"
+    printf '%s|%s|%s|%s\n' "$name" "$small_display" "$large_display" "$status" > "$size_result_file"
+}
+
+size_trace_status_label() {
+    case "$1" in
+        Same) printf '未发现差异' ;;
+        Split) printf '疑似大小包分流' ;;
+        Fluctuation) printf '路由波动' ;;
+        Unknown) printf '无法判断' ;;
+        *) printf '探测失败' ;;
+    esac
+}
+
+show_size_trace_summary() {
+    local tmp_dir="$1"
+    local i name small_path large_path status
+    local same=0 split=0 fluctuation=0 unknown=0 failed=0
+    local abnormal=0
+    local -a names=() small_paths=() large_paths=() statuses=()
+
+    for i in "${!TRACE_NAMES[@]}"; do
+        if [ -s "$tmp_dir/size.$i" ]; then
+            IFS='|' read -r name small_path large_path status < "$tmp_dir/size.$i" || true
+        else
+            name="${TRACE_NAMES[$i]}"
+            small_path="失败"
+            large_path="失败"
+            status="Fail"
+        fi
+        names[i]="$name"
+        small_paths[i]="$small_path"
+        large_paths[i]="$large_path"
+        statuses[i]="$status"
+        case "$status" in
+            Same) same=$((same + 1)) ;;
+            Split) split=$((split + 1)) ;;
+            Fluctuation) fluctuation=$((fluctuation + 1)) ;;
+            Unknown) unknown=$((unknown + 1)) ;;
+            *) failed=$((failed + 1)) ;;
+        esac
+        [ "$status" = "Same" ] || abnormal=$((abnormal + 1))
+    done
+
+    cat <<EOF
+========================================
+ 大小包路由对比
+========================================
+方式：TCP 80　小包：${TRACE_SIZE_SMALL} B　大包：${TRACE_SIZE_LARGE} B
+结果：一致 $same | 疑似分流 $split | 波动 $fluctuation | 无法判断 $unknown | 失败 $failed
+EOF
+    if [ "$abnormal" -eq 0 ]; then
+        printf '%d 个目标未发现大小包路径差异。\n' "${#TRACE_NAMES[@]}"
+        return 0
+    fi
+
+    cat <<'EOF'
+------------------------------------------------------------------------
+差异/异常详情：
+目标       | 小包路径 | 大包路径 | 结果
+EOF
+    for i in "${!TRACE_NAMES[@]}"; do
+        [ "${statuses[$i]}" = "Same" ] && continue
+        printf ' %-10s | %s | %s | %s\n' \
+            "${names[$i]}" "${small_paths[$i]}" "${large_paths[$i]}" "$(size_trace_status_label "${statuses[$i]}")"
+    done
 }
 
 format_trace_cell() {
@@ -4490,7 +4760,7 @@ show_backtrace_matrix() {
 
     cat <<EOF
  报告时间：$report_time
- 方式：TCP 80　目标：$total　并发：$TRACE_MAX_JOBS
+ 方式：TCP 80　包大小：${TRACE_SIZE_SMALL} B　目标：$total　并发：1
 --------------------------------------------------------
  地区    电信          联通          移动
 EOF
@@ -4518,55 +4788,58 @@ EOF
 show_backtrace_routes() {
     validate_trace_targets || return 1
     ensure_nexttrace || return 1
+    nexttrace_supports_size_compare || return 1
 
-    local i
-    local name
-    local ip
-    local tmp_dir
-    local result_file
-    local job_count=0
-    local completed=0
+    local i name ip tmp_dir source_port
+    local total="${#TRACE_NAMES[@]}"
 
+    # 固定源端口并严格串行，避免五元组变化或并发 TCP 探测造成路径误判。
+    source_port="$(random_port)" || return 1
     tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)" || { err "无法创建回程检测临时目录。"; return 1; }
     [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] || { err "回程检测临时目录路径异常。"; return 1; }
-    trap 'rm -rf "$tmp_dir"' RETURN
+    ACTIVE_TRACE_TMP="$tmp_dir"
+    trap 'cleanup_active_trace_tmp' RETURN
 
     cat <<EOF
 ========================================
- 三网回程检测
+ 三网回程与大小包路由对比
 ========================================
 模式：TCP 80
-正在分批检测 ${#TRACE_NAMES[@]} 个目标，每批最多 ${TRACE_MAX_JOBS} 个，每个最多 30 秒，请稍等...
+包大小：${TRACE_SIZE_SMALL} B / ${TRACE_SIZE_LARGE} B
+策略：严格串行，首轮不同的目标自动反向复测
+目标：$total 个，每次探测最多 30 秒，请稍等...
 EOF
 
     for i in "${!TRACE_NAMES[@]}"; do
         name="${TRACE_NAMES[$i]}"
         ip="${TRACE_IPS[$i]}"
-        check_route_target "$name" "$ip" "$tmp_dir/$i" &
-        job_count=$((job_count + 1))
-        if [ "$job_count" -ge "$TRACE_MAX_JOBS" ]; then
-            wait
-            completed=$((completed + job_count))
-            printf '\r进度：%d/%d' "$completed" "${#TRACE_NAMES[@]}"
-            job_count=0
+        printf '[%d/%d] %s：%s B → %s B\n' \
+            "$((i + 1))" "$total" "$name" "$TRACE_SIZE_SMALL" "$TRACE_SIZE_LARGE"
+        if ! check_combined_route_target \
+            "$name" "$ip" "$source_port" "$tmp_dir/probe.$i" "$tmp_dir/$i" "$tmp_dir/size.$i"; then
+            err "$name 的三网回程与大小包检测未完成。"
+            return 1
         fi
     done
 
-    if [ "$job_count" -gt 0 ]; then
-        wait
-        completed=$((completed + job_count))
-        printf '\r进度：%d/%d' "$completed" "${#TRACE_NAMES[@]}"
-    fi
-    printf '\n'
+    cat <<EOF
 
+========================================
+ 三网回程（TCP 80，${TRACE_SIZE_SMALL} B）
+========================================
+EOF
     show_backtrace_matrix "$tmp_dir"
 
-    rm -rf "$tmp_dir"
+    printf '\n'
+    show_size_trace_summary "$tmp_dir"
+
+    cleanup_active_trace_tmp
     trap - RETURN
 
-    cat <<EOF
+    cat <<'EOF'
 ========================================
 提示：线路判断仅供参考；CN2 GT/GIA 以完整路径的 ASN 与跳数为准，可用 nexttrace 手动复核。
+大小包结果只表示路由是否与探测包大小相关，不能单独证明线路存在人为欺骗。
 EOF
 }
 
