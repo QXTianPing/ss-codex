@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.16"
+VPSBOX_VERSION="v1.0.17"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -1771,7 +1771,7 @@ port_is_effective_ssh_port() {
 choose_node_port() {
     local existing_port="${1:-}" input confirm docker_ports
 
-    docker_ports="$(docker_reserved_ports_csv)" || {
+    docker_ports="$(docker_reserved_ports_for_port_choice)" || {
         err "无法可靠读取 Docker 已发布端口，已取消节点端口选择。"
         return 1
     }
@@ -3739,7 +3739,7 @@ ssh_socket_activation_active() {
 choose_ssh_target_port() {
     local input confirm docker_ports
 
-    docker_ports="$(docker_reserved_ports_csv)" || {
+    docker_ports="$(docker_reserved_ports_for_port_choice)" || {
         err "无法可靠读取 Docker 已发布端口，已取消 SSH 端口选择。"
         return 1
     }
@@ -3942,10 +3942,11 @@ EOF
 }
 
 apply_ssh_port_change() {
-    local confirm new_port original_ports write_action
+    local confirm new_port original_ports retired_ports write_action
     local suffix
     local main_backup=""
     local dropin_backup=""
+    local vpsbox_firewall_active=0
 
     if ! sshd_binary >/dev/null 2>&1; then
         err "未找到 sshd，无法修改 SSH 配置。"
@@ -3975,7 +3976,12 @@ apply_ssh_port_change() {
         esac
     fi
 
-    read -r -p "确认已在商家安全组放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm
+    if firewall_runtime_enabled; then
+        vpsbox_firewall_active=1
+        read -r -p "vpsbox 防火墙将自动临时放行 TCP $SSH_TARGET_PORT；如厂商另有安全组，请先在厂商面板放行。输入 YES 继续: " confirm
+    else
+        read -r -p "确认已在商家安全组或其他外部防火墙放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm
+    fi
     if [ "$confirm" != "YES" ]; then
         info "已取消，未修改 SSH 配置。"
         return 0
@@ -3985,6 +3991,10 @@ apply_ssh_port_change() {
     backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || return 1
     backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || return 1
     original_ports="$(ssh_effective_ports_csv)" || { err "无法读取 SSH 当前生效端口，已取消修改。"; return 1; }
+    retired_ports="$(csv_remove_port "$original_ports" "$SSH_TARGET_PORT")" || {
+        err "无法计算 SSH 旧端口，已取消修改。"
+        return 1
+    }
     manifest_set_once SSH_PORTS "$original_ports" || return 1
 
     suffix="$(date +%F-%H%M%S)"
@@ -4057,7 +4067,23 @@ apply_ssh_port_change() {
     [ -n "$dropin_backup" ] && info "vpsbox SSH 端口配置备份：$dropin_backup"
     warn "不要关闭当前 SSH 窗口。"
     warn "请另开一个新窗口测试：ssh -p $SSH_TARGET_PORT root@你的服务器IP"
-    warn "确认新端口可以登录后，再去商家安全组关闭 TCP 22。"
+    if [ -n "$retired_ports" ]; then
+        if [ "$vpsbox_firewall_active" -eq 1 ]; then
+            warn "确认新端口可以登录后，请在新 SSH 会话再次更新 vpsbox 防火墙，以移除可能因旧会话暂时保留的端口（$retired_ports）。"
+            warn "如果厂商安全组仍放行旧端口（$retired_ports），届时也可在厂商面板关闭。"
+        else
+            warn "确认新端口可以登录后，再在商家安全组或其他外部防火墙关闭旧端口（$retired_ports）。"
+        fi
+    fi
+}
+
+ssh_port_change_firewall_hint() {
+    if firewall_runtime_enabled; then
+        echo "vpsbox 防火墙运行中，新端口将自动临时放行并同步。"
+        echo "如厂商另有安全组，仍需先在厂商面板放行新端口。"
+    else
+        echo "请先在商家安全组或其他外部防火墙放行即将输入的 TCP 端口。"
+    fi
 }
 
 apply_ssh_basic_hardening() {
@@ -4335,7 +4361,7 @@ ssh_port_change_menu() {
  新端口：创建时输入，留空默认 23333
 ----------------------------------------
 将根据当前 SSH 配置，最小化修改主配置或 vpsbox drop-in。
-请先在商家安全组放行即将输入的 TCP 端口。
+$(ssh_port_change_firewall_hint)
 ----------------------------------------
  [1] 应用 SSH 端口修改
  [2] 恢复 vpsbox SSH 配置（高风险）
@@ -5606,6 +5632,21 @@ docker_reserved_ports_csv() {
         return 1
     }
     printf '%s\n' "$reserved"
+}
+
+docker_reserved_ports_for_port_choice() {
+    local result
+
+    if result="$(docker_reserved_ports_csv)"; then
+        printf '%s\n' "$result"
+        return 0
+    fi
+    if firewall_control_plane_present; then
+        [ -z "$result" ] || printf '%s\n' "$result" >&2
+        return 1
+    fi
+    warn "无法可靠读取 Docker 已发布端口；当前未启用 vpsbox 防火墙，本次仅检查系统实际监听端口。Docker 恢复后请确认没有端口冲突。" >&2
+    printf '\n'
 }
 
 firewall_detect_allowed_ports() {
@@ -7010,6 +7051,10 @@ check_warn() {
     check_row "WARN" "$1" "${2:-}"
 }
 
+check_info() {
+    check_row "INFO" "$1" "${2:-}"
+}
+
 check_fail() {
     check_row "FAIL" "$1" "${2:-}"
 }
@@ -7166,9 +7211,9 @@ EOF
 
     if ! firewall_control_plane_present; then
         if [ -e "$FIREWALL_STATE_FILE" ]; then
-            check_warn "主机防火墙" "未启用，已保存额外端口"
+            check_info "主机防火墙" "未启用，已保存额外端口"
         else
-            check_warn "主机防火墙" "未启用"
+            check_info "主机防火墙" "未启用（如已使用厂商安全组可忽略）"
         fi
     elif ! firewall_managed_file_is_secure "$FIREWALL_CONFIG" ||
         ! firewall_state_file_is_secure; then

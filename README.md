@@ -2,7 +2,7 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
-当前版本：`v1.0.16`
+当前版本：`v1.0.17`
 
 ## VPS 一键安装
 
@@ -113,43 +113,3 @@ sing-box 管理
 [5] 一键 VPS 系统重装脚本（bin456789）
 [0] 返回主菜单
 ```
-
-## 功能
-
-- 自动检查并安装 sing-box
-- 创建/重建 SS 2022 节点（可手动指定端口，留空自动随机）
-- 创建/重建 VLESS Reality 节点（分别输入客户端连接地址与 Reality 目标域名/SNI；SNI 留空默认 `addons.mozilla.org`）
-- 校验节点域名/IP 格式
-- 随机端口
-- 随机强密码
-- 固定加密：2022-blake3-aes-128-gcm
-- 查看节点链接
-- 删除当前节点
-- 启动、停止、重启 sing-box
-- 一键自检，包含系统优化状态和端口安全组建议
-- nftables 主机防火墙，自动放行 SSH、SS/VLESS，守卫本机 rootful Docker 普通 NAT bridge 的已发布 TCP/UDP 端口，并支持额外端口
-- 防火墙使用独立 `table inet vpsbox`，不执行全局 `flush ruleset`，不创建出站规则
-- Docker 转发链保持默认允许，但会按 IPv4/IPv6 检查所有 DNAT 入站流量；仅运行中容器的实际公开发布端口及其 Docker bridge 自动纳入，回环发布和停止容器不会进入公网 DNAT 白名单，其他网桥上的手工 DNAT、KVM/LXD/Podman 转发端口需加入“额外放行端口”
-- 检测到实际 `docker-proxy` 通配地址监听时，会按 IPv4/IPv6 与 TCP/UDP 补充 INPUT 放行；回环地址监听不会对外放行
-- 为避免把绑定地址扩大到其他本机地址，Docker 发布到特定非回环 HostIp 时会拒绝更新；请改用通配/回环绑定，或自行管理防火墙
-- 远程 context、rootless、Swarm、多个 dockerd、direct routing、routed/nat-unprotected、SCTP 和已连接的非 bridge Docker 网络会被拒绝；dockerd 配置文件在 daemon 启动后变更时也会要求先重启 Docker；host 网络端口需手动加入额外放行列表
-- 安装 Docker，或创建、删除、启动、停止容器及网络后，应再次执行“开启/更新防火墙”；新 NAT 发布端口在更新前默认无法通过端口守卫
-- 对已探测的 Docker bridge，容器发出的转发保持允许，外部未经过 DNAT、直接路由到容器 IP 的新连接会被丢弃；后续 Docker 网络变更仍必须重新执行防火墙更新
-- 防火墙首次应用或更新提供 90 秒 SSH 自动回滚保护；NAT 端口映射和商家安全组仍需单独设置
-- 三网回程与大小包路由对比（北京、上海、广东、安徽、江苏共 15 个固定 IPv4 三网目标；固定 TCP 源端口，使用 64 B 结果生成三网矩阵，并与 1400 B 路径比较；首轮不同时自动反向复测）
-- 提供 IP 质量体检、网络质量体检、TCP 质量检测、VPS 综合质量测试和系统重装的第三方项目地址与上游命令提示，展示后退出 vpsbox，不自动执行第三方脚本
-- 系统更新
-- 一键开启 BBR + fq（先验证内核能力与运行时生效，再写入持久化配置；失败会恢复运行时参数）
-- 安装 Fail2ban
-- 开启 NTP 时间同步，使用 chrony 自动校准系统时间并设置开机自启
-- 限制 systemd 日志大小（使用独立 drop-in，历史日志清理需单独确认）
-- 修改系统 IPv4 DNS
-- 启用系统 IPv4 优先，IPv4 不可用时 IPv6 仍可兜底
-- 修改 SSH 端口（留空默认 23333），并按 SSH 当前实际生效端口同步 Fail2ban sshd jail
-- SSH 基础加固，启用低风险 SSH 配置项
-- 查看 SSH 当前生效配置
-- 更新 sing-box（节点配置检查或服务恢复失败时，自动尝试恢复更新前的二进制）
-- 更新 vpsbox 脚本
-- 打开已安装的管理面板时检查远程版本，发现新版后自动备份、校验、更新并重新打开管理面板；失败时继续使用当前版本
-- 卸载 vpsbox
-- 可单独确认删除 sing-box 和所有节点配置
