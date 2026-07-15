@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.18"
+VPSBOX_VERSION="v1.0.19"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -36,6 +36,16 @@ FIREWALL_SYSTEMD_UNIT="/etc/systemd/system/vpsbox-firewall.service"
 FIREWALL_OPENRC_SERVICE="/etc/init.d/vpsbox-firewall"
 FIREWALL_SERVICE_NAME="vpsbox-firewall"
 FIREWALL_ROLLBACK_SECONDS=90
+PACKAGE_CONNECT_TIMEOUT=15
+PACKAGE_UPDATE_TIMEOUT=120
+PACKAGE_INSTALL_TIMEOUT=600
+PACKAGE_KILL_GRACE=10
+PACKAGE_RETRY_MAX=2
+PACKAGE_RETRY_DELAY=2
+ACTIVE_BOUNDED_PID=""
+ACTIVE_BOUNDED_START=""
+ACTIVE_BOUNDED_TIMER_PID=""
+ACTIVE_BOUNDED_MARKER=""
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
@@ -142,6 +152,168 @@ retry() {
     done
 }
 
+run_bounded_in_new_session() {
+    local limit="$1" marker pid start="" timer status marker_state i
+
+    shift
+    marker="$(mktemp /tmp/vpsbox-command-timeout.XXXXXX)" || return 1
+    printf '%s\n' pending > "$marker"
+    setsid "$@" &
+    pid=$!
+
+    for i in {1..50}; do
+        if ! process_alive "$pid" || process_is_zombie "$pid"; then
+            if wait "$pid"; then status=0; else status=$?; fi
+            if [ "$status" -ne 0 ] && bounded_session_has_processes "$pid"; then
+                terminate_bounded_session "$pid" 1
+            fi
+            rm -f -- "$marker"
+            return "$status"
+        fi
+        start="$(process_start_ticks "$pid" || true)"
+        if [[ "$start" =~ ^[0-9]+$ ]] && bounded_process_group_matches "$pid" "$start"; then
+            break
+        fi
+        start=""
+        sleep 0.02
+    done
+    if [ -z "$start" ]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -f -- "$marker"
+        err "无法为命令建立独立进程组，已取消执行：$1"
+        return 125
+    fi
+
+    ACTIVE_BOUNDED_PID="$pid"
+    ACTIVE_BOUNDED_START="$start"
+    ACTIVE_BOUNDED_MARKER="$marker"
+    (
+        sleep "$limit"
+        if bounded_process_group_matches "$pid" "$start"; then
+            printf '%s\n' timeout > "$marker"
+            terminate_bounded_session "$pid" "$PACKAGE_KILL_GRACE"
+        fi
+    ) &
+    timer=$!
+    ACTIVE_BOUNDED_TIMER_PID="$timer"
+
+    if wait "$pid"; then status=0; else status=$?; fi
+    marker_state="$(cat "$marker" 2>/dev/null || true)"
+    if [ "$marker_state" = "timeout" ]; then
+        wait "$timer" 2>/dev/null || true
+        status=124
+    else
+        kill -TERM "$timer" 2>/dev/null || true
+        wait "$timer" 2>/dev/null || true
+        if [ "$status" -ne 0 ] && bounded_session_has_processes "$pid"; then
+            terminate_bounded_session "$pid" 1
+        fi
+    fi
+
+    ACTIVE_BOUNDED_PID=""
+    ACTIVE_BOUNDED_START=""
+    ACTIVE_BOUNDED_TIMER_PID=""
+    ACTIVE_BOUNDED_MARKER=""
+    rm -f -- "$marker"
+    return "$status"
+}
+
+run_bounded_with_timeout() {
+    local limit="$1" status
+
+    shift
+    if timeout -k 1 1 true >/dev/null 2>&1; then
+        if timeout -k "$PACKAGE_KILL_GRACE" "$limit" "$@"; then return 0; else status=$?; fi
+    else
+        # 兼容 BusyBox 1.35 之前不支持 timeout -k 的版本；主流程优先使用 setsid。
+        warn "当前 timeout 不支持强制终止延迟，使用兼容模式。"
+        if timeout "$limit" "$@"; then return 0; else status=$?; fi
+    fi
+    return "$status"
+}
+
+run_bounded_command() {
+    local limit="$1" status
+
+    shift
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] && [ "$#" -gt 0 ] || return 2
+    if command -v setsid >/dev/null 2>&1; then
+        if run_bounded_in_new_session "$limit" "$@"; then return 0; else status=$?; fi
+    elif command -v timeout >/dev/null 2>&1; then
+        if run_bounded_with_timeout "$limit" "$@"; then return 0; else status=$?; fi
+    else
+        err "缺少 setsid/timeout，已拒绝执行无时限命令：$1"
+        return 127
+    fi
+    case "$status" in
+        124|137|143)
+            err "命令执行超时或被强制终止（上限 ${limit} 秒）：$1"
+            ;;
+    esac
+    return "$status"
+}
+
+retry_bounded_command() {
+    local max="$1" delay="$2" limit="$3"
+    local attempt=1 status=0
+
+    shift 3
+    while [ "$attempt" -le "$max" ]; do
+        if run_bounded_command "$limit" "$@"; then
+            return 0
+        else
+            status=$?
+        fi
+        case "$status" in
+            124|125|126|127|137|143) return "$status" ;;
+        esac
+        if [ "$attempt" -ge "$max" ]; then
+            err "命令重试 ${max} 次后仍失败：$*"
+            return "$status"
+        fi
+        warn "命令失败，${delay} 秒后重试（${attempt}/${max}）：$*"
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
+apt_get_bounded() {
+    local limit="$1"
+
+    shift
+    retry_bounded_command "$PACKAGE_RETRY_MAX" "$PACKAGE_RETRY_DELAY" "$limit" \
+        apt-get \
+        -o "Acquire::Retries=1" \
+        -o "Acquire::http::Timeout=$PACKAGE_CONNECT_TIMEOUT" \
+        -o "Acquire::https::Timeout=$PACKAGE_CONNECT_TIMEOUT" \
+        -o "Dpkg::Lock::Timeout=$PACKAGE_CONNECT_TIMEOUT" \
+        "$@"
+}
+
+apk_bounded() {
+    local limit="$1"
+
+    shift
+    retry_bounded_command "$PACKAGE_RETRY_MAX" "$PACKAGE_RETRY_DELAY" "$limit" apk "$@"
+}
+
+dnf_bounded() {
+    local limit="$1"
+
+    shift
+    retry_bounded_command "$PACKAGE_RETRY_MAX" "$PACKAGE_RETRY_DELAY" "$limit" \
+        dnf --setopt="timeout=$PACKAGE_CONNECT_TIMEOUT" --setopt="retries=1" "$@"
+}
+
+yum_bounded() {
+    local limit="$1"
+
+    shift
+    retry_bounded_command "$PACKAGE_RETRY_MAX" "$PACKAGE_RETRY_DELAY" "$limit" \
+        yum --setopt="timeout=$PACKAGE_CONNECT_TIMEOUT" --setopt="retries=1" "$@"
+}
+
 pause() {
     echo ""
     read -r -p "按回车返回当前菜单..." _ || exit 0
@@ -201,6 +373,118 @@ process_start_ticks() {
     stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
     stat="${stat##*) }"
     printf '%s\n' "$stat" | awk '{print $20}'
+}
+
+process_is_zombie() {
+    local pid="$1" stat
+
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    [ "${stat%% *}" = "Z" ]
+}
+
+process_group_session_ids() {
+    local pid="$1" stat _state _ppid pgrp session
+
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    read -r _state _ppid pgrp session _ <<< "$stat"
+    [[ "$pgrp" =~ ^[0-9]+$ && "$session" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "$pgrp" "$session"
+}
+
+bounded_process_group_identity_matches() {
+    local pid="$1" expected_start="$2" ids
+
+    process_alive "$pid" || return 1
+    [ "$(process_start_ticks "$pid" 2>/dev/null || true)" = "$expected_start" ] || return 1
+    ids="$(process_group_session_ids "$pid" || true)"
+    [ "$ids" = "$pid $pid" ]
+}
+
+bounded_process_group_matches() {
+    local pid="$1" expected_start="$2"
+
+    bounded_process_group_identity_matches "$pid" "$expected_start" || return 1
+    ! process_is_zombie "$pid"
+}
+
+bounded_session_has_processes() {
+    local session="$1" stat_path stat _state _ppid _pgrp sid
+
+    for stat_path in /proc/[0-9]*/stat; do
+        [ -r "$stat_path" ] || continue
+        stat="$(cat "$stat_path" 2>/dev/null || true)"
+        [ -n "$stat" ] || continue
+        stat="${stat##*) }"
+        read -r _state _ppid _pgrp sid _ <<< "$stat"
+        [ "$sid" = "$session" ] && return 0
+    done
+    return 1
+}
+
+bounded_session_signal() {
+    local session="$1" signal="$2" stat_path stat _state _ppid _pgrp sid pid leader_matches=0
+
+    case "$signal" in TERM|KILL) ;; *) return 2 ;; esac
+    # 会话成员只能由该命令派生；先通知子进程，最后通知会话 leader。
+    for stat_path in /proc/[0-9]*/stat; do
+        [ -r "$stat_path" ] || continue
+        pid="${stat_path#/proc/}"
+        pid="${pid%/stat}"
+        [ "$pid" != "$$" ] && [ "$pid" -gt 1 ] || continue
+        stat="$(cat "$stat_path" 2>/dev/null || true)"
+        [ -n "$stat" ] || continue
+        stat="${stat##*) }"
+        read -r _state _ppid _pgrp sid _ <<< "$stat"
+        [ "$sid" = "$session" ] || continue
+        if [ "$pid" = "$session" ]; then
+            leader_matches=1
+            continue
+        fi
+        kill "-$signal" "$pid" 2>/dev/null || true
+    done
+    if [ "$leader_matches" -eq 1 ]; then
+        kill "-$signal" "$session" 2>/dev/null || true
+    fi
+}
+
+terminate_bounded_session() {
+    local session="$1" grace="$2" i loops
+
+    bounded_session_signal "$session" TERM
+    loops=$((grace * 10))
+    [ "$loops" -gt 0 ] || loops=1
+    for ((i = 0; i < loops; i++)); do
+        bounded_session_has_processes "$session" || return 0
+        sleep 0.1
+    done
+    if bounded_session_has_processes "$session"; then
+        bounded_session_signal "$session" KILL
+    fi
+}
+
+cleanup_active_bounded_command() {
+    local pid="${ACTIVE_BOUNDED_PID:-}" start="${ACTIVE_BOUNDED_START:-}"
+    local timer="${ACTIVE_BOUNDED_TIMER_PID:-}" marker="${ACTIVE_BOUNDED_MARKER:-}"
+
+    ACTIVE_BOUNDED_PID=""
+    ACTIVE_BOUNDED_START=""
+    ACTIVE_BOUNDED_TIMER_PID=""
+    ACTIVE_BOUNDED_MARKER=""
+    if is_pid "$timer"; then
+        kill -TERM "$timer" 2>/dev/null || true
+        wait "$timer" 2>/dev/null || true
+    fi
+    if is_pid "$pid" && [[ "$start" =~ ^[0-9]+$ ]] &&
+        { bounded_process_group_identity_matches "$pid" "$start" ||
+            { ! process_alive "$pid" && bounded_session_has_processes "$pid"; }; }; then
+        terminate_bounded_session "$pid" 1
+        wait "$pid" 2>/dev/null || true
+    fi
+    if [[ "$marker" == /tmp/vpsbox-command-timeout.* ]] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
+        rm -f -- "$marker"
+    fi
 }
 
 process_stdin_tty() {
@@ -268,6 +552,9 @@ cleanup_active_trace_tmp() {
 cleanup_vpsbox_runtime() {
     local backup="${ACTIVE_NODE_BACKUP:-}"
     local firewall_rollback="${ACTIVE_FIREWALL_ROLLBACK_DIR:-}"
+    if declare -F cleanup_active_bounded_command >/dev/null 2>&1; then
+        cleanup_active_bounded_command
+    fi
     if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ]; then
         if declare -F rollback_active_node_transaction >/dev/null 2>&1; then
             rollback_active_node_transaction || true
@@ -291,7 +578,12 @@ cleanup_vpsbox_runtime() {
         declare -F firewall_restore_snapshot_now >/dev/null 2>&1; then
         if [ -e "$firewall_rollback/completed" ]; then
             ACTIVE_FIREWALL_ROLLBACK_DIR=""
-            rm -rf "$firewall_rollback"
+            if declare -F firewall_cleanup_finished_rollback >/dev/null 2>&1; then
+                firewall_cleanup_finished_rollback "$firewall_rollback" ||
+                    warn "防火墙规则已提交，但回滚进程清理尚未完成：$firewall_rollback"
+            else
+                rm -rf "$firewall_rollback"
+            fi
         elif [ "$(cat "$firewall_rollback/decision" 2>/dev/null || true)" = "commit" ]; then
             firewall_restore_snapshot_now "$firewall_rollback" 1 ||
                 warn "防火墙操作被中断，自动恢复失败；快照已保留：$firewall_rollback"
@@ -542,7 +834,7 @@ download_vpsbox_script() {
         : > "$tmp"
     fi
 
-    if ! retry 3 2 curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+    if ! retry 3 2 curl -fsSL --connect-timeout 8 --max-time 180 "$SCRIPT_URL" -o "$tmp"; then
         rm -f "$tmp"
         err "下载失败，请检查网络或 GitHub raw 地址。"
         return 1
@@ -737,9 +1029,13 @@ run_singbox_installer() {
     fi
     case "$OS" in
         debian) dpkg -i "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
-        alpine) apk add --allow-untrusted "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
+        alpine) apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --allow-untrusted "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
         redhat)
-            if command -v dnf >/dev/null 2>&1; then dnf install -y "$tmp"; else yum install -y "$tmp"; fi || { rm -rf "$tmp_dir"; return 1; }
+            if command -v dnf >/dev/null 2>&1; then
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y "$tmp"
+            else
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y "$tmp"
+            fi || { rm -rf "$tmp_dir"; return 1; }
             ;;
     esac
     rm -rf "$tmp_dir"
@@ -878,19 +1174,19 @@ install_deps() {
 
     case "$OS" in
         alpine)
-            retry 3 2 apk update
-            retry 3 2 apk add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils
+            apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update || return 1
+            apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils || return 1
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            retry 3 2 apt-get update -y
-            retry 3 2 apt-get install -y curl ca-certificates openssl jq iproute2 coreutils
+            apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update -y || return 1
+            apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y curl ca-certificates openssl jq iproute2 coreutils || return 1
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                retry 3 2 dnf install -y curl ca-certificates openssl jq iproute coreutils
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y curl ca-certificates openssl jq iproute coreutils || return 1
             else
-                retry 3 2 yum install -y curl ca-certificates openssl jq iproute coreutils
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y curl ca-certificates openssl jq iproute coreutils || return 1
             fi
             ;;
         *)
@@ -3284,20 +3580,20 @@ enable_ntp_sync() {
     case "$OS" in
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            retry 3 2 apt-get update -y || return 1
-            if ! retry 3 2 apt-get install -y chrony; then
+            apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update -y || return 1
+            if ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
                 show_chrony_permission_hint "$(chrony_service_name)"
                 return 1
             fi
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                if ! retry 3 2 dnf install -y chrony; then
+                if ! dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
                     show_chrony_permission_hint "$(chrony_service_name)"
                     return 1
                 fi
             else
-                if ! retry 3 2 yum install -y chrony; then
+                if ! yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
                     show_chrony_permission_hint "$(chrony_service_name)"
                     return 1
                 fi
@@ -3778,18 +4074,12 @@ EOF
 }
 
 enable_ipv4_priority() {
-    local backup=""
-
     info "正在启用系统 IPv4 优先，不会禁用 IPv6。"
-    backup_change_file_once GAI_CONF "$GAI_CONF" || { err "记录 IPv4 优先原配置失败，已取消修改。"; return 1; }
-
-    if [ -s "$GAI_CONF" ]; then
-        backup="${GAI_CONF}.bak.$(date +%F-%H%M%S)"
-        if ! cp -a "$GAI_CONF" "$backup"; then
-            err "备份 $GAI_CONF 失败，已取消修改。"
-            return 1
-        fi
+    if [ "$(ipv4_priority_state)" = "已启用" ]; then
+        info "系统 IPv4 优先已启用，无需重复修改。"
+        return 0
     fi
+    backup_change_file_once GAI_CONF "$GAI_CONF" || { err "记录 IPv4 优先原配置失败，已取消修改。"; return 1; }
 
     if ! touch "$GAI_CONF"; then
         err "无法创建或写入 $GAI_CONF。"
@@ -3808,7 +4098,6 @@ enable_ipv4_priority() {
 
     info "已写入：precedence ::ffff:0:0/96 100"
     mark_change_applied GAI_CONF || return 1
-    [ -n "$backup" ] && info "原配置备份：$backup"
     info "当前 IPv4 优先：$(ipv4_priority_state)"
     info "可用 curl ip.sb 或 curl -v ip.sb 验证默认出口。"
 }
@@ -5062,14 +5351,15 @@ install_fail2ban() {
     case "$OS" in
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            if ! retry 3 2 apt update ||
-                ! retry 3 2 apt install -y fail2ban ||
+            if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban ||
                 ! retry 3 2 systemctl enable --now fail2ban; then
                 warn "Fail2ban 安装或启动未完全成功，将尝试写入最小 SSH 配置后重启。"
             fi
             ;;
         alpine)
-            if ! retry 3 2 apk update || ! retry 3 2 apk add --no-cache fail2ban; then
+            if ! apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban; then
                 err "Fail2ban 安装失败。"
                 return 1
             fi
@@ -5082,9 +5372,9 @@ install_fail2ban() {
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                retry 3 2 dnf install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
             else
-                retry 3 2 yum install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
             fi
             if is_systemd; then
                 retry 3 2 systemctl enable --now fail2ban || true
@@ -5413,12 +5703,12 @@ ensure_nftables() {
     case "$OS" in
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            retry 3 2 apt-get update -y || return 1
-            retry 3 2 apt-get install -y nftables jq iproute2 coreutils || return 1
+            apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update -y || return 1
+            apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y nftables jq iproute2 coreutils || return 1
             ;;
         alpine)
-            retry 3 2 apk update || return 1
-            retry 3 2 apk add --no-cache nftables jq iproute2 coreutils || return 1
+            apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update || return 1
+            apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache nftables jq iproute2 coreutils || return 1
             ;;
         *)
             err "主机防火墙目前仅支持 Debian/Ubuntu 与 Alpine。"
@@ -6422,6 +6712,231 @@ firewall_snapshot_file() {
     fi
 }
 
+firewall_watchdog_cmdline_matches() {
+    local dir="$1" pid="$2"
+    local -a args=()
+
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ] || return 1
+    process_alive "$pid" || return 1
+    process_is_zombie "$pid" && return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || true
+    [ "${#args[@]}" -eq 2 ] || return 1
+    case "${args[0]}" in
+        sh|*/sh) ;;
+        *) return 1 ;;
+    esac
+    [ "${args[1]}" = "$dir/rollback.sh" ]
+}
+
+firewall_watchdog_process_matches() {
+    local dir="$1" pid="$2" expected_start="$3"
+
+    firewall_watchdog_cmdline_matches "$dir" "$pid" || return 1
+    [ "$(process_start_ticks "$pid" 2>/dev/null || true)" = "$expected_start" ]
+}
+
+firewall_watchdog_identity_matches() {
+    local dir="$1" pid="$2"
+    local path recorded_pid recorded_start recorded_boot current_start current_boot
+
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 2
+    is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ] || return 2
+    for path in "$dir/watchdog.pid" "$dir/watchdog.start" "$dir/watchdog.boot"; do
+        [ -f "$path" ] && [ ! -L "$path" ] || return 2
+    done
+    IFS= read -r recorded_pid < "$dir/watchdog.pid" || return 2
+    IFS= read -r recorded_start < "$dir/watchdog.start" || return 2
+    IFS= read -r recorded_boot < "$dir/watchdog.boot" || return 2
+    [ "$recorded_pid" = "$pid" ] && [[ "$recorded_start" =~ ^[0-9]+$ ]] &&
+        [ -n "$recorded_boot" ] || return 2
+
+    process_alive "$pid" || return 1
+    process_is_zombie "$pid" && return 1
+    current_start="$(process_start_ticks "$pid" || true)"
+    current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    [ -n "$current_start" ] && [ "$recorded_start" = "$current_start" ] || return 1
+    [ -n "$current_boot" ] && [ "$recorded_boot" = "$current_boot" ] || return 1
+    firewall_watchdog_cmdline_matches "$dir" "$pid" || return 1
+}
+
+firewall_sleep_process_matches() {
+    local pid="$1" expected_start="$2"
+    local -a args=()
+
+    process_alive "$pid" || return 1
+    process_is_zombie "$pid" && return 1
+    [ "$(process_start_ticks "$pid" 2>/dev/null || true)" = "$expected_start" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || true
+    [ "${#args[@]}" -eq 2 ] || return 1
+    case "${args[0]}" in
+        sleep|*/sleep) ;;
+        *) return 1 ;;
+    esac
+    [ "${args[1]}" = "1" ] || [ "${args[1]}" = "$FIREWALL_ROLLBACK_SECONDS" ]
+}
+
+firewall_watchdog_sleep_records() {
+    local parent="$1" child start children
+
+    children="$(cat "/proc/$parent/task/$parent/children" 2>/dev/null || true)"
+    for child in $children; do
+        is_pid "$child" || continue
+        start="$(process_start_ticks "$child" 2>/dev/null || true)"
+        [[ "$start" =~ ^[0-9]+$ ]] || continue
+        firewall_sleep_process_matches "$child" "$start" || continue
+        printf '%s:%s\n' "$child" "$start"
+    done
+}
+
+firewall_stop_recorded_sleeps() {
+    local records="$1" record pid start i failed=0
+
+    for record in $records; do
+        pid="${record%%:*}"
+        start="${record#*:}"
+        firewall_sleep_process_matches "$pid" "$start" || continue
+        kill -TERM "$pid" 2>/dev/null || true
+        for i in {1..10}; do
+            firewall_sleep_process_matches "$pid" "$start" || break
+            sleep 0.1
+        done
+        if firewall_sleep_process_matches "$pid" "$start"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        for i in {1..10}; do
+            firewall_sleep_process_matches "$pid" "$start" || break
+            sleep 0.1
+        done
+        firewall_sleep_process_matches "$pid" "$start" && failed=1
+    done
+    [ "$failed" -eq 0 ]
+}
+
+firewall_forget_watchdog_metadata() {
+    local dir="$1"
+
+    rm -f "$dir/watchdog.pid" "$dir/watchdog.start" "$dir/watchdog.boot"
+}
+
+firewall_wait_watchdog_exit() {
+    local pid="$1" i
+
+    for i in {1..20}; do
+        if ! process_alive "$pid" || process_is_zombie "$pid"; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+firewall_stop_verified_watchdog() {
+    local dir="$1" pid="$2" start="$3" status sleep_records
+
+    firewall_watchdog_process_matches "$dir" "$pid" "$start" || return 0
+    sleep_records="$(firewall_watchdog_sleep_records "$pid")"
+    if firewall_wait_watchdog_exit "$pid"; then
+        firewall_stop_recorded_sleeps "$sleep_records"
+        return $?
+    fi
+
+    firewall_stop_recorded_sleeps "$sleep_records" || status=1
+    if firewall_wait_watchdog_exit "$pid"; then
+        return "${status:-0}"
+    fi
+    firewall_watchdog_process_matches "$dir" "$pid" "$start" || return "${status:-0}"
+
+    kill -TERM "$pid" 2>/dev/null || true
+    if firewall_wait_watchdog_exit "$pid"; then
+        return "${status:-0}"
+    fi
+    firewall_watchdog_process_matches "$dir" "$pid" "$start" || return "${status:-0}"
+
+    kill -KILL "$pid" 2>/dev/null || true
+    if firewall_wait_watchdog_exit "$pid"; then
+        return "${status:-0}"
+    fi
+    return 1
+}
+
+firewall_find_watchdog_pids() {
+    local dir="$1" proc pid
+
+    for proc in /proc/[0-9]*; do
+        [ -d "$proc" ] || continue
+        pid="${proc##*/}"
+        firewall_watchdog_cmdline_matches "$dir" "$pid" || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+firewall_stop_rollback_watchdog() {
+    local dir="$1" path pid start found_pid
+
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    for path in "$dir/watchdog.pid" "$dir/watchdog.start" "$dir/watchdog.boot"; do
+        [ ! -e "$path" ] || { [ -f "$path" ] && [ ! -L "$path" ]; } || {
+            warn "防火墙回滚进程元数据路径不安全，已保留快照：$dir"
+            return 1
+        }
+    done
+    if [ -e "$dir/watchdog.pid" ]; then
+        IFS= read -r pid < "$dir/watchdog.pid" || pid=""
+        if is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ]; then
+            # 兼容 v1.0.18 仅写 watchdog.pid 的快照；同一分支也处理当前版本分步写元数据时的中断状态。
+            if [ -e "$dir/watchdog.start" ] && [ -e "$dir/watchdog.boot" ]; then
+                if firewall_watchdog_identity_matches "$dir" "$pid"; then
+                    start="$(process_start_ticks "$pid")"
+                fi
+            fi
+            if [ -z "${start:-}" ] && firewall_watchdog_cmdline_matches "$dir" "$pid"; then
+                start="$(process_start_ticks "$pid" 2>/dev/null || true)"
+            fi
+            if [[ "${start:-}" =~ ^[0-9]+$ ]]; then
+                firewall_stop_verified_watchdog "$dir" "$pid" "$start" || {
+                    warn "防火墙回滚进程未能退出，快照已保留：$dir"
+                    return 1
+                }
+            elif process_is_zombie "$pid"; then
+                wait "$pid" 2>/dev/null || true
+            fi
+        else
+            warn "防火墙回滚进程 PID 元数据无效，将按脚本路径安全扫描：$dir"
+        fi
+    fi
+
+    # PID 文件仅作为快速定位提示；最终扫描精确命令行，可收敛空文件、陈旧 PID 和落盘前中断。
+    while IFS= read -r found_pid; do
+        [ -n "$found_pid" ] || continue
+        start="$(process_start_ticks "$found_pid" 2>/dev/null || true)"
+        [[ "$start" =~ ^[0-9]+$ ]] || continue
+        firewall_stop_verified_watchdog "$dir" "$found_pid" "$start" || {
+            warn "防火墙回滚进程未能退出，快照已保留：$dir"
+            return 1
+        }
+    done < <(firewall_find_watchdog_pids "$dir")
+    firewall_forget_watchdog_metadata "$dir"
+    return 0
+}
+
+firewall_cleanup_finished_rollback() {
+    local dir="$1"
+
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ] || return 1
+    firewall_stop_rollback_watchdog "$dir" || return 1
+    [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
+    rm -rf -- "$dir"
+}
+
 firewall_recover_pending_rollbacks() {
     local dir decision owner
 
@@ -6441,8 +6956,10 @@ firewall_recover_pending_rollbacks() {
             return 1
         fi
         if [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ]; then
-            [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
-            rm -rf "$dir"
+            if ! firewall_cleanup_finished_rollback "$dir"; then
+                err "已完成的防火墙快照清理失败，已拒绝开始新的防火墙操作：$dir"
+                return 1
+            fi
             continue
         fi
         decision="$(cat "$dir/decision" 2>/dev/null || true)"
@@ -6513,9 +7030,30 @@ dir='$final_dir'
 nft='$nft_path'
 failed=0
 mode="\${1:-}"
+sleep_pid=''
+
+stop_watchdog_wait() {
+    if [ -n "\$sleep_pid" ]; then
+        kill -TERM "\$sleep_pid" 2>/dev/null || true
+        wait "\$sleep_pid" 2>/dev/null || true
+    fi
+    exit 0
+}
 
 if [ "\$mode" != "--now" ] && [ "\$mode" != "--commit-owner" ]; then
-    sleep $FIREWALL_ROLLBACK_SECONDS
+    trap stop_watchdog_wait HUP INT TERM
+    waited=0
+    while [ "\$waited" -lt "$FIREWALL_ROLLBACK_SECONDS" ]; do
+        [ -d "\$dir" ] || exit 0
+        [ ! -e "\$dir/completed" ] || exit 0
+        [ ! -e "\$dir/rolled-back" ] || exit 0
+        sleep 1 &
+        sleep_pid=\$!
+        wait "\$sleep_pid" || exit 0
+        sleep_pid=''
+        waited=\$((waited + 1))
+    done
+    trap - HUP INT TERM
 fi
 [ -d "\$dir" ] || exit 0
 [ ! -e "\$dir/completed" ] || exit 0
@@ -6633,14 +7171,23 @@ EOF
 }
 
 firewall_start_rollback_watchdog() {
-    local dir="$1" pid
+    local dir="$1" pid start boot
     [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
         [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
     : > "$dir/armed"
     nohup sh "$dir/rollback.sh" >> "$dir/rollback.log" 2>&1 &
     pid=$!
-    process_alive "$pid" || return 1
-    printf '%s\n' "$pid" > "$dir/watchdog.pid"
+    start="$(process_start_ticks "$pid" || true)"
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    if ! process_alive "$pid" || ! [[ "$start" =~ ^[0-9]+$ ]] || [ -z "$boot" ] ||
+        ! printf '%s\n' "$pid" > "$dir/watchdog.pid" ||
+        ! printf '%s\n' "$start" > "$dir/watchdog.start" ||
+        ! printf '%s\n' "$boot" > "$dir/watchdog.boot"; then
+        kill -TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        firewall_forget_watchdog_metadata "$dir"
+        return 1
+    fi
 }
 
 firewall_restore_snapshot_now() {
@@ -6652,7 +7199,8 @@ firewall_restore_snapshot_now() {
     fi
     if [ -e "$dir/completed" ]; then
         [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
-        rm -rf "$dir"
+        firewall_cleanup_finished_rollback "$dir" ||
+            warn "防火墙操作已提交，但回滚进程清理尚未完成：$dir"
         return 0
     fi
     [ -x "$dir/rollback.sh" ] || return 1
@@ -6661,7 +7209,8 @@ firewall_restore_snapshot_now() {
     for i in {1..90}; do
         if [ -e "$dir/rolled-back" ]; then
             [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
-            rm -rf "$dir"
+            firewall_cleanup_finished_rollback "$dir" ||
+                warn "防火墙快照已恢复，但回滚进程清理尚未完成：$dir"
             return 0
         fi
         [ -e "$dir/rollback-failed" ] && {
@@ -6693,7 +7242,8 @@ firewall_finish_commit() {
     [ "$(cat "$dir/decision" 2>/dev/null || true)" = "commit" ] || return 1
     : > "$dir/completed" || return 1
     ACTIVE_FIREWALL_ROLLBACK_DIR=""
-    rm -rf "$dir" || true
+    firewall_cleanup_finished_rollback "$dir" ||
+        warn "防火墙规则已提交，但回滚进程清理尚未完成：$dir"
     return 0
 }
 
