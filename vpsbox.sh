@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.17"
+VPSBOX_VERSION="v1.0.18"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -46,6 +46,8 @@ ACTIVE_FIREWALL_TRANSITION_DIR=""
 ACTIVE_SSH_FIREWALL_TRANSITION=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
 ACTIVE_TRACE_TMP=""
+ACTIVE_FAIL2BAN_TEST_IP=""
+ACTIVE_FAIL2BAN_TEST_BACKENDS=""
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -297,6 +299,10 @@ cleanup_vpsbox_runtime() {
             firewall_restore_snapshot_now "$firewall_rollback" 0 ||
                 warn "防火墙操作被中断，自动恢复失败；快照已保留：$firewall_rollback"
         fi
+    fi
+    if declare -F cleanup_active_fail2ban_test >/dev/null 2>&1; then
+        cleanup_active_fail2ban_test ||
+            warn "Fail2ban 测试地址自动解封失败，请按错误提示手动清理。"
     fi
     cleanup_active_trace_tmp
     cleanup_vpsbox_lock
@@ -554,10 +560,24 @@ download_vpsbox_script() {
         return 1
     fi
     downloaded_version="$(sed -n 's/^VPSBOX_VERSION="\([^"]*\)"$/\1/p' "$tmp" | head -n 1)"
-    if [ "$require_newer" = "1" ] && ! version_is_newer "$downloaded_version" "$VPSBOX_VERSION"; then
-        rm -f "$tmp"
-        err "远程版本 $downloaded_version 不高于当前版本 $VPSBOX_VERSION，已取消更新。"
-        return 1
+    if [ "$require_newer" = "1" ]; then
+        case "$(version_relation "$downloaded_version" "$VPSBOX_VERSION")" in
+            newer) ;;
+            same)
+                rm -f "$tmp"
+                return 2
+                ;;
+            older)
+                rm -f "$tmp"
+                warn "远程版本 $downloaded_version 低于当前版本 $VPSBOX_VERSION，已拒绝降级。"
+                return 3
+                ;;
+            *)
+                rm -f "$tmp"
+                err "无法比较远程版本 $downloaded_version 与当前版本 $VPSBOX_VERSION。"
+                return 1
+                ;;
+        esac
     fi
 
     chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
@@ -590,6 +610,22 @@ version_is_newer() {
     done
 
     return 1
+}
+
+version_relation() {
+    local candidate="$1"
+    local current="$2"
+
+    [[ "$candidate" =~ ^v?[0-9]+([.][0-9]+){2}$ ]] || return 1
+    [[ "$current" =~ ^v?[0-9]+([.][0-9]+){2}$ ]] || return 1
+
+    if version_is_newer "$candidate" "$current"; then
+        printf '%s\n' newer
+    elif version_is_newer "$current" "$candidate"; then
+        printf '%s\n' older
+    else
+        printf '%s\n' same
+    fi
 }
 
 check_vpsbox_update_on_start() {
@@ -2466,6 +2502,7 @@ delete_node() {
 
 update_singbox() {
     local binary_path backup_dir backup_binary old_version
+    local relation
     local was_active=0 was_enabled=0
 
     if ! singbox_installed; then
@@ -2477,6 +2514,21 @@ update_singbox() {
     binary_path="$(command -v sing-box)"
     old_version="$(singbox_version)"
     [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || { err "无法识别当前 sing-box 版本，已取消更新。"; return 1; }
+    relation="$(version_relation "$SINGBOX_RELEASE_VERSION" "$old_version")" || {
+        err "无法比较 sing-box 版本，已取消更新。"
+        return 1
+    }
+    case "$relation" in
+        same)
+            info "sing-box 当前已是受管版本 v$SINGBOX_RELEASE_VERSION，无需更新。"
+            return 0
+            ;;
+        older)
+            warn "当前 sing-box v$old_version 高于受管版本 v$SINGBOX_RELEASE_VERSION，已拒绝隐式降级。"
+            return 0
+            ;;
+        newer) ;;
+    esac
     backup_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
     backup_binary="$backup_dir/sing-box"
     cp -a "$binary_path" "$backup_binary" || { rm -rf "$backup_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
@@ -2532,29 +2584,57 @@ update_singbox() {
 
 update_vpsbox() {
     local backup="${CMD_PATH}.previous"
+    local candidate
     local status
 
     info "正在下载最新 vpsbox 脚本..."
+    mkdir -p "$(dirname "$CMD_PATH")" || return 1
+    candidate="$(mktemp "$(dirname "$CMD_PATH")/.vpsbox-update.XXXXXX")" || return 1
+    if download_vpsbox_script "$candidate" 1; then
+        :
+    else
+        status=$?
+        rm -f "$candidate"
+        REMOTE_VERSION=""
+        UPDATE_AVAILABLE=0
+        case "$status" in
+            2)
+                info "当前已是最新版，无需更新。"
+                return 0
+                ;;
+            3) return 0 ;;
+            *) return "$status" ;;
+        esac
+    fi
+
     if [ -f "$CMD_PATH" ]; then
         cp -a "$CMD_PATH" "$backup" || {
+            rm -f "$candidate"
             err "备份当前 vpsbox 脚本失败，已取消更新。"
             return 1
         }
-        chmod 700 "$backup" || return 1
+        chmod 700 "$backup" || { rm -f "$candidate"; return 1; }
     fi
-
-    download_vpsbox_script "$CMD_PATH" 1 || return 1
+    if ! mv -f "$candidate" "$CMD_PATH"; then
+        rm -f "$candidate"
+        err "替换 vpsbox 脚本失败，已保留当前版本。"
+        return 1
+    fi
     install_command_alias
 
     info "vpsbox 已更新；旧版本备份：$backup"
     info "正在重新打开新版管理面板..."
     cleanup_vpsbox_lock
-    exec "$CMD_PATH" || {
+    reexec_updated_vpsbox || {
         status=$?
         err "无法重新打开新版管理面板，正在恢复当前菜单运行锁。"
         acquire_lock
         return "$status"
     }
+}
+
+reexec_updated_vpsbox() {
+    exec "$CMD_PATH"
 }
 
 bbr_state() {
@@ -2651,6 +2731,430 @@ fail2ban_sshd_state() {
     else
         echo "端口未同步"
     fi
+}
+
+fail2ban_action_names() {
+    local output header
+
+    output="$(fail2ban-client get sshd actions 2>/dev/null)" || return 1
+    header="${output%%$'\n'*}"
+    [[ "$header" == "The jail sshd has the following actions:" ]] || return 1
+    printf '%s\n' "$output" |
+        sed '1d' |
+        tr ',' '\n' |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d'
+}
+
+fail2ban_single_action_line() {
+    local line
+
+    line="$(printf '%s\n' "$1" |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d')"
+    [ -n "$line" ] && [[ "$line" != *$'\n'* ]] || return 1
+    printf '%s\n' "$line"
+}
+
+fail2ban_action_executable() {
+    local line="$1" executable
+
+    read -r executable _ <<< "$line"
+    executable="${executable#\"}"
+    executable="${executable%\"}"
+    printf '%s\n' "$executable"
+}
+
+fail2ban_simple_action_is_safe() {
+    local actionban="$1"
+
+    [[ "$actionban" != *';'* ]] &&
+        [[ "$actionban" != *'|'* ]] &&
+        [[ "$actionban" != *'&'* ]] &&
+        [[ "$actionban" != *'`'* ]] &&
+        [[ "$actionban" != *'$('* ]]
+}
+
+fail2ban_ipset_action_backend() {
+    local actionban="$1" safe left right executable
+
+    [[ "$actionban" == *'<ip>'* ]] || return 1
+    [[ "$actionban" != *';'* ]] || return 1
+    [[ "$actionban" != *'&'* ]] || return 1
+    [[ "$actionban" != *'`'* ]] || return 1
+    [[ "$actionban" != *'$('* ]] || return 1
+    safe="${actionban//||/}"
+    [[ "$safe" != *'|'* ]] || return 1
+
+    if [[ "$actionban" == *'||'* ]]; then
+        left="$(fail2ban_single_action_line "${actionban%%||*}")" || return 1
+        right="${actionban#*||}"
+        [[ "$right" != *'||'* ]] || return 1
+        right="$(fail2ban_single_action_line "$right")" || return 1
+        executable="$(fail2ban_action_executable "$left")"
+        case "$executable" in ipset|*/ipset|'<ipset>') ;; *) return 1 ;; esac
+        executable="$(fail2ban_action_executable "$right")"
+        case "$executable" in ipset|*/ipset|'<ipset>') ;; *) return 1 ;; esac
+        [[ " $left " == *' --test '* && " $right " == *' --add '* ]] || return 1
+    else
+        left="$(fail2ban_single_action_line "$actionban")" || return 1
+        executable="$(fail2ban_action_executable "$left")"
+        case "$executable" in ipset|*/ipset|'<ipset>') ;; *) return 1 ;; esac
+        [[ " $left " == *' add '* ]] || return 1
+    fi
+    printf '%s\n' ipset
+}
+
+fail2ban_ufw_action_backend() {
+    local actionban="$1" safe line executable after_and
+    local saw_if=0 saw_then=0 saw_else=0 saw_fi=0 ufw_commands=0
+
+    [[ "$actionban" == *'<ip>'* ]] || return 1
+    [[ "$actionban" != *';'* ]] || return 1
+    [[ "$actionban" != *'|'* ]] || return 1
+    [[ "$actionban" != *'`'* ]] || return 1
+    [[ "$actionban" != *'$('* ]] || return 1
+    safe="${actionban//&&/}"
+    [[ "$safe" != *'&'* ]] || return 1
+
+    while IFS= read -r line; do
+        line="$(printf '%s\n' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$line" ] || continue
+        case "$line" in
+            if\ \[\ -n\ *' ] && '* )
+                [ "$saw_if" -eq 0 ] || return 1
+                after_and="${line#* ] && }"
+                executable="$(fail2ban_action_executable "$after_and")"
+                case "$executable" in ufw|*/ufw|'<ufw>') ;; *) return 1 ;; esac
+                [[ " $after_and " == *' app info '* ]] || return 1
+                saw_if=1
+                ;;
+            then) saw_then=$((saw_then + 1)) ;;
+            else) saw_else=$((saw_else + 1)) ;;
+            fi) saw_fi=$((saw_fi + 1)) ;;
+            *)
+                executable="$(fail2ban_action_executable "$line")"
+                case "$executable" in ufw|*/ufw|'<ufw>') ;; *) return 1 ;; esac
+                [[ " $line " == *' from <ip> '* ]] || return 1
+                ufw_commands=$((ufw_commands + 1))
+                ;;
+        esac
+    done <<< "$actionban"
+    [ "$saw_if" -eq 1 ] && [ "$saw_then" -eq 1 ] &&
+        [ "$saw_else" -eq 1 ] && [ "$saw_fi" -eq 1 ] &&
+        [ "$ufw_commands" -eq 2 ] || return 1
+    printf '%s\n' ufw
+}
+
+fail2ban_action_backend() {
+    local action="$1" actionban="$2" line executable
+
+    [[ "$actionban" == *'<ip>'* ]] || return 1
+    case "$action" in
+        nftables|nftables-multiport|nftables-allports)
+            fail2ban_simple_action_is_safe "$actionban" || return 1
+            line="$(fail2ban_single_action_line "$actionban")" || return 1
+            executable="$(fail2ban_action_executable "$line")"
+            case "$executable" in nft|*/nft|'<nft>'|'<nftables>') ;; *) return 1 ;; esac
+            [[ " $line " == *' add element '* ]] || return 1
+            printf '%s\n' nftables
+            ;;
+        iptables|iptables-multiport|iptables-allports)
+            fail2ban_simple_action_is_safe "$actionban" || return 1
+            line="$(fail2ban_single_action_line "$actionban")" || return 1
+            executable="$(fail2ban_action_executable "$line")"
+            case "$executable" in iptables|*/iptables|'<iptables>') ;; *) return 1 ;; esac
+            [[ " $line " == *' -I '* && " $line " == *' -s <ip> '* ]] || return 1
+            printf '%s\n' iptables
+            ;;
+        iptables-ipset|iptables-ipset-*)
+            fail2ban_ipset_action_backend "$actionban"
+            ;;
+        ipset)
+            fail2ban_ipset_action_backend "$actionban"
+            ;;
+        ufw)
+            fail2ban_ufw_action_backend "$actionban"
+            ;;
+        firewallcmd-new|firewallcmd-multiport|firewallcmd-allports|firewallcmd-ipset)
+            fail2ban_simple_action_is_safe "$actionban" || return 1
+            line="$(fail2ban_single_action_line "$actionban")" || return 1
+            executable="$(fail2ban_action_executable "$line")"
+            case "$executable" in
+                firewall-cmd|*/firewall-cmd|'<firewall-cmd>')
+                    if [[ " $line " == *' --direct --add-rule '* && " $line " == *' -s <ip> '* ]] ||
+                        [[ " $line " == *' --add-entry=<ip> '* ]]; then
+                        printf '%s\n' firewalld
+                    else
+                        return 1
+                    fi
+                    ;;
+                ipset|*/ipset|'<ipset>')
+                    [[ " $line " == *' add '* ]] || return 1
+                    printf '%s\n' ipset
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+fail2ban_effective_firewall_backends() {
+    local actions action actionban backend backends=""
+
+    actions="$(fail2ban_action_names)" || {
+        err "无法读取 Fail2ban sshd jail 的动作列表，已取消真实封禁验证。"
+        return 1
+    }
+    [ -n "$actions" ] || {
+        err "Fail2ban sshd jail 没有可验证的封禁动作。"
+        return 1
+    }
+
+    while IFS= read -r action; do
+        [ -n "$action" ] || continue
+        actionban="$(fail2ban-client get sshd action "$action" actionban 2>/dev/null)" || {
+            err "无法读取 Fail2ban 动作 $action 的实际封禁命令。"
+            return 1
+        }
+        [ -n "$actionban" ] || {
+            err "Fail2ban 动作 $action 没有实际封禁命令。"
+            return 1
+        }
+        backend="$(fail2ban_action_backend "$action" "$actionban")" || {
+            err "Fail2ban 动作 $action 不是受支持的纯防火墙封禁命令；为避免通知或外部副作用，未执行测试封禁。"
+            return 1
+        }
+        if ! grep -qxF "$backend" <<< "$backends"; then
+            backends+="${backends:+$'\n'}$backend"
+        fi
+    done <<< "$actions"
+
+    [ -n "$backends" ] || return 1
+    printf '%s\n' "$backends"
+}
+
+fail2ban_backend_dump() {
+    local backend="$1" ipsets ipset_name
+
+    case "$backend" in
+        nftables)
+            command -v nft >/dev/null 2>&1 || return 1
+            nft list ruleset 2>/dev/null
+            ;;
+        iptables)
+            command -v iptables-save >/dev/null 2>&1 || return 1
+            iptables-save 2>/dev/null
+            ;;
+        ipset)
+            command -v ipset >/dev/null 2>&1 || return 1
+            ipset save 2>/dev/null
+            ;;
+        ufw)
+            command -v ufw >/dev/null 2>&1 || return 1
+            ufw show raw 2>/dev/null
+            ;;
+        firewalld)
+            command -v firewall-cmd >/dev/null 2>&1 || return 1
+            firewall-cmd --direct --get-all-rules 2>/dev/null || return 1
+            firewall-cmd --list-all-zones 2>/dev/null || return 1
+            ipsets="$(firewall-cmd --get-ipsets 2>/dev/null)" || return 1
+            for ipset_name in $ipsets; do
+                firewall-cmd --ipset="$ipset_name" --get-entries 2>/dev/null || return 1
+            done
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+fail2ban_backends_readable() {
+    local backends="$1" backend
+
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        if ! fail2ban_backend_dump "$backend" >/dev/null; then
+            err "无法读取 Fail2ban 的 $backend 防火墙后端；请检查对应命令与运行状态。"
+            return 1
+        fi
+    done <<< "$backends"
+}
+
+fail2ban_ipv4_in_text() {
+    local ip="$1"
+    local text="${2:-}"
+    local escaped
+
+    is_ipv4_address "$ip" || return 1
+    escaped="${ip//./\\.}"
+    grep -Eq "(^|[^0-9.])${escaped}(/32)?([^0-9./]|$)" <<< "$text"
+}
+
+fail2ban_jail_has_ip() {
+    local ip="$1" output
+
+    output="$(fail2ban-client get sshd banip 2>/dev/null)" || return 2
+    fail2ban_ipv4_in_text "$ip" "$output"
+}
+
+fail2ban_backend_has_ip() {
+    local backend="$1" ip="$2" output
+
+    output="$(fail2ban_backend_dump "$backend")" || return 2
+    fail2ban_ipv4_in_text "$ip" "$output"
+}
+
+fail2ban_test_state_present() {
+    local ip="$1" backends="$2" backend status
+
+    if fail2ban_jail_has_ip "$ip"; then
+        :
+    else
+        status=$?
+        [ "$status" -eq 1 ] && return 1
+        return 2
+    fi
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        if fail2ban_backend_has_ip "$backend" "$ip"; then
+            :
+        else
+            status=$?
+            [ "$status" -eq 1 ] && return 1
+            return 2
+        fi
+    done <<< "$backends"
+    return 0
+}
+
+fail2ban_test_state_absent() {
+    local ip="$1" backends="$2" backend status
+
+    if fail2ban_jail_has_ip "$ip"; then
+        return 1
+    else
+        status=$?
+        [ "$status" -eq 1 ] || return 2
+    fi
+    while IFS= read -r backend; do
+        [ -n "$backend" ] || continue
+        if fail2ban_backend_has_ip "$backend" "$ip"; then
+            return 1
+        else
+            status=$?
+            [ "$status" -eq 1 ] || return 2
+        fi
+    done <<< "$backends"
+    return 0
+}
+
+fail2ban_test_client_ipv4() {
+    local ip=""
+
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        ip="${SSH_CONNECTION%% *}"
+    elif [ -n "${SSH_CLIENT:-}" ]; then
+        ip="${SSH_CLIENT%% *}"
+    fi
+    is_ipv4_address "$ip" && printf '%s\n' "$ip"
+}
+
+fail2ban_local_ipv4_text() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -o -4 addr show 2>/dev/null
+    elif command -v hostname >/dev/null 2>&1; then
+        hostname -I 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+fail2ban_select_test_ip() {
+    local backends="$1" client_ip local_ipv4 candidate status
+    local -a candidates=(
+        "192.0.2.254" "198.51.100.254" "203.0.113.254"
+        "192.0.2.253" "198.51.100.253" "203.0.113.253"
+    )
+
+    client_ip="$(fail2ban_test_client_ipv4 || true)"
+    local_ipv4="$(fail2ban_local_ipv4_text)" || return 1
+    for candidate in "${candidates[@]}"; do
+        [ "$candidate" = "$client_ip" ] && continue
+        fail2ban_ipv4_in_text "$candidate" "$local_ipv4" && continue
+        if fail2ban_test_state_absent "$candidate" "$backends"; then
+            printf '%s\n' "$candidate"
+            return 0
+        else
+            status=$?
+            [ "$status" -eq 1 ] && continue
+            return 1
+        fi
+    done
+    return 1
+}
+
+cleanup_active_fail2ban_test() {
+    local ip="${ACTIVE_FAIL2BAN_TEST_IP:-}"
+    local backends="${ACTIVE_FAIL2BAN_TEST_BACKENDS:-}"
+    local attempt
+
+    [ -n "$ip" ] || return 0
+    for attempt in 1 2 3 4 5; do
+        fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 || true
+        if fail2ban_test_state_absent "$ip" "$backends"; then
+            ACTIVE_FAIL2BAN_TEST_IP=""
+            ACTIVE_FAIL2BAN_TEST_BACKENDS=""
+            return 0
+        fi
+        [ "$attempt" -lt 5 ] && sleep 1
+    done
+
+    err "Fail2ban 测试地址 $ip 未能自动完全解封。"
+    err "请保持当前 SSH 会话并执行：fail2ban-client set sshd unbanip $ip"
+    return 1
+}
+
+verify_fail2ban_real_ban() {
+    local backends test_ip attempt present=0
+
+    if [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ] && ! cleanup_active_fail2ban_test; then
+        err "上一次 Fail2ban 测试地址仍未清理，已拒绝开始新的验证。"
+        return 2
+    fi
+    backends="$(fail2ban_effective_firewall_backends)" || return 1
+    fail2ban_backends_readable "$backends" || return 1
+    test_ip="$(fail2ban_select_test_ip "$backends")" || {
+        err "无法选出未被占用的 TEST-NET IPv4 测试地址。"
+        return 1
+    }
+
+    ACTIVE_FAIL2BAN_TEST_IP="$test_ip"
+    ACTIVE_FAIL2BAN_TEST_BACKENDS="$backends"
+    info "正在验证 Fail2ban sshd jail 与实际防火墙封禁链路..."
+    if ! fail2ban-client set sshd banip "$test_ip" >/dev/null 2>&1; then
+        err "Fail2ban 测试封禁命令执行失败。"
+        if cleanup_active_fail2ban_test; then
+            return 1
+        fi
+        return 2
+    fi
+    for attempt in 1 2 3 4 5; do
+        if fail2ban_test_state_present "$test_ip" "$backends"; then
+            present=1
+            break
+        fi
+        [ "$attempt" -lt 5 ] && sleep 1
+    done
+    if [ "$present" -ne 1 ]; then
+        err "测试地址未同时出现在 sshd jail 与实际防火墙后端。"
+        if cleanup_active_fail2ban_test; then
+            return 1
+        fi
+        return 2
+    fi
+    if ! cleanup_active_fail2ban_test; then
+        return 2
+    fi
+
+    info "Fail2ban 真实封禁、后端落地与解封清理验证通过。"
 }
 
 chrony_service_name() {
@@ -3820,6 +4324,33 @@ warn_ssh_access_controls() {
     fi
 }
 
+restore_fail2ban_sshd_sync_state() {
+    local backup="$1" was_running="$2"
+
+    if [ -n "$backup" ]; then
+        cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
+    else
+        rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
+    fi
+    fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
+
+    if is_systemd; then
+        if [ "$was_running" -eq 1 ]; then
+            retry 3 1 systemctl restart fail2ban >/dev/null
+        else
+            retry 3 1 systemctl stop fail2ban >/dev/null
+        fi
+    elif command -v rc-service >/dev/null 2>&1; then
+        if [ "$was_running" -eq 1 ]; then
+            retry 3 1 rc-service fail2ban restart >/dev/null
+        else
+            retry 3 1 rc-service fail2ban stop >/dev/null
+        fi
+    else
+        return 1
+    fi
+}
+
 sync_fail2ban_sshd_port() {
     local backup=""
     local backend="auto"
@@ -3936,6 +4467,19 @@ EOF
             fi
         fi
         err "Fail2ban 服务已启动，但 sshd jail 未在预期时间内就绪。"
+        return 1
+    fi
+    if verify_fail2ban_real_ban; then
+        :
+    else
+        service_action=$?
+        if [ "$service_action" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
+            err "Fail2ban 真实封禁验证失败，且测试地址仍有残留；为保留解封能力，暂不回滚当前 jail。"
+        elif restore_fail2ban_sshd_sync_state "$backup" "$was_running"; then
+            err "Fail2ban 真实封禁验证失败，已恢复同步前的配置与服务状态。"
+        else
+            err "Fail2ban 真实封禁验证失败，且同步前状态未能完整恢复，请检查服务与配置。"
+        fi
         return 1
     fi
     mark_change_applied FAIL2BAN_SSHD || return 1
@@ -8729,7 +9273,7 @@ main_loop() {
             5) run_menu_action run_self_check; pause ;;
             6) run_menu_action show_backtrace_routes; pause ;;
             7) run_menu_action other_scripts_menu ;;
-            00) update_vpsbox; pause ;;
+            00) run_menu_action update_vpsbox; pause ;;
             88) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
@@ -8737,10 +9281,16 @@ main_loop() {
     done
 }
 
-need_root
-detect_os
-acquire_lock
-install_self_command
-check_vpsbox_update_on_start
-auto_update_vpsbox_on_start
-main_loop
+vpsbox_main() {
+    need_root
+    detect_os
+    acquire_lock
+    install_self_command
+    check_vpsbox_update_on_start
+    auto_update_vpsbox_on_start
+    main_loop
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    vpsbox_main "$@"
+fi
