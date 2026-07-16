@@ -51,8 +51,18 @@ trap test_cleanup EXIT
 
 write_fixture() {
     local path="$1" version="$2" marker="$3"
-    printf '#!/usr/bin/env bash\nVPSBOX_VERSION="%s"\nprintf %s\\n\n' \
-        "$version" "'$marker'" > "$path"
+    cat > "$path" <<EOF
+#!/usr/bin/env bash
+APP_NAME="vpsbox"
+VPSBOX_VERSION="$version"
+SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+vpsbox_main() {
+    printf '%s\n' '$marker'
+}
+if [[ "\${BASH_SOURCE[0]}" == "\$0" ]]; then
+    vpsbox_main "\$@"
+fi
+EOF
     chmod 755 "$path"
 }
 
@@ -88,7 +98,7 @@ cleanup_vpsbox_lock() {
 }
 
 reexec_updated_vpsbox() {
-    printf '%s\n' reexec >> "$MOCK_EVENT_LOG"
+    printf 'reexec:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
 }
 
 acquire_lock() {
@@ -104,6 +114,8 @@ reset_update_case() {
     MOCK_REMOTE_SCRIPT="$CASE_DIR/remote.sh"
     MOCK_EVENT_LOG="$CASE_DIR/events.log"
     : > "$MOCK_EVENT_LOG"
+    RUNTIME_DIR="$CASE_DIR/run"
+    mkdir -p "$RUNTIME_DIR"
     REMOTE_VERSION="v9.9.9"
     UPDATE_AVAILABLE=1
 }
@@ -162,7 +174,8 @@ test_vpsbox_newer_updates_once() {
     assert_file_contains "${CMD_PATH}.previous" 'installed'
     assert_file_contains "$MOCK_EVENT_LOG" '^alias$'
     assert_file_contains "$MOCK_EVENT_LOG" '^cleanup-lock$'
-    assert_file_contains "$MOCK_EVENT_LOG" '^reexec$'
+    grep -Fqx -- "reexec:${CMD_PATH}.previous" "$MOCK_EVENT_LOG" ||
+        fail "更新后重新执行必须携带本次 .previous 备份路径"
 }
 
 test_vpsbox_invalid_download_preserves_current() {
@@ -180,6 +193,198 @@ test_vpsbox_invalid_download_preserves_current() {
     assert_file_contains "$CMD_PATH" 'installed'
     assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
     assert_empty_file "$MOCK_EVENT_LOG" "下载校验失败不得触发替换后的副作用"
+}
+
+test_vpsbox_wrong_project_preserves_current() {
+    local output="$TEST_TMP/wrong-project.out"
+    reset_update_case wrong-project
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    printf 'keep-backup\n' > "${CMD_PATH}.previous"
+    cat > "$MOCK_REMOTE_SCRIPT" <<EOF
+#!/usr/bin/env bash
+VPSBOX_VERSION="$UPDATE_TEST_NEWER"
+printf '%s\n' wrong-project
+EOF
+    chmod 755 "$MOCK_REMOTE_SCRIPT"
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail "仅伪造高版本号的错误项目脚本必须报失败"
+    fi
+
+    assert_file_contains "$output" '缺少 vpsbox 项目标识或必要入口'
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
+    assert_empty_file "$MOCK_EVENT_LOG" "项目身份校验失败不得触发替换后的副作用"
+}
+
+test_vpsbox_reexec_failure_restores_previous() {
+    local output="$TEST_TMP/reexec-failure.out"
+    reset_update_case reexec-failure
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    reexec_updated_vpsbox() {
+        printf 'reexec-failed:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
+        return 42
+    }
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail "新版重新执行失败时应返回失败"
+    fi
+
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_fixture_version "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT"
+    grep -Fqx -- "reexec-failed:${CMD_PATH}.previous" "$MOCK_EVENT_LOG" ||
+        fail "重执行失败路径未收到本次备份路径"
+    assert_file_contains "$MOCK_EVENT_LOG" '^acquire-lock$'
+    assert_file_contains "$output" '已从 .*previous 恢复旧版 vpsbox'
+}
+
+test_pending_update_startup_failure_restores_previous() {
+    local status
+
+    reset_update_case startup-rollback
+    write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+    cat > "$CMD_PATH" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$REPO_DIR/vpsbox.sh"
+CMD_PATH="$TARGET_PATH"
+RUNTIME_DIR="$RUNTIME_TARGET"
+LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
+LOCK_DIR="$RUNTIME_DIR/lockdir"
+install_command_alias() { :; }
+need_root() { return 42; }
+vpsbox_main
+EOF
+    chmod 755 "$CMD_PATH"
+
+    set +e
+    REPO_DIR="$REPO_DIR" TARGET_PATH="$CMD_PATH" RUNTIME_TARGET="$RUNTIME_DIR" bash -c '
+        set -euo pipefail
+        source "$REPO_DIR/vpsbox.sh"
+        CMD_PATH="$TARGET_PATH"
+        RUNTIME_DIR="$RUNTIME_TARGET"
+        LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
+        LOCK_DIR="$RUNTIME_DIR/lockdir"
+        install_command_alias() { :; }
+        reexec_updated_vpsbox "${TARGET_PATH}.previous"
+    ' >"$TEST_TMP/startup-rollback.out" 2>&1
+    status=$?
+    set -e
+
+    assert_eq 42 "$status" "新版启动失败的原退出状态不应被回滚处理吞掉"
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_fixture_version "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$TEST_TMP/startup-rollback.out" '未完成首次界面启动'
+    assert_file_contains "$TEST_TMP/startup-rollback.out" '已从 .*previous 恢复旧版 vpsbox'
+}
+
+test_top_level_startup_failure_restores_previous() {
+    local status restored=0
+
+    reset_update_case top-level-rollback
+    write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+    cat > "$CMD_PATH" <<EOF
+#!/usr/bin/env bash
+exit 41
+APP_NAME="vpsbox"
+VPSBOX_VERSION="$UPDATE_TEST_NEWER"
+SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+vpsbox_main() {
+    printf '%s\n' should-not-run
+}
+if [[ "\${BASH_SOURCE[0]}" == "\$0" ]]; then
+    vpsbox_main "\$@"
+fi
+EOF
+    chmod 755 "$CMD_PATH"
+    vpsbox_script_identity_valid "$CMD_PATH" ||
+        fail "测试候选应能通过现有静态身份校验"
+
+    set +e
+    REPO_DIR="$REPO_DIR" TARGET_PATH="$CMD_PATH" RUNTIME_TARGET="$RUNTIME_DIR" bash -c '
+        set -euo pipefail
+        source "$REPO_DIR/vpsbox.sh"
+        CMD_PATH="$TARGET_PATH"
+        RUNTIME_DIR="$RUNTIME_TARGET"
+        LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
+        LOCK_DIR="$RUNTIME_DIR/lockdir"
+        install_command_alias() { :; }
+        reexec_updated_vpsbox "${TARGET_PATH}.previous"
+    ' >"$TEST_TMP/top-level-rollback.out" 2>&1
+    status=$?
+    set -e
+
+    assert_eq 41 "$status" "候选顶层退出码不应被监护进程吞掉"
+    for _ in {1..50}; do
+        if grep -Fq installed "$CMD_PATH" 2>/dev/null; then
+            restored=1
+            break
+        fi
+        sleep 0.1
+    done
+    assert_eq 1 "$restored" "候选在进入 vpsbox_main 前退出时应自动恢复旧版"
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$CMD_PATH" 'installed'
+}
+
+test_pending_update_confirmation_prevents_rollback() {
+    local ready_dir ready
+
+    reset_update_case startup-confirmed
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
+    write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+    ready_dir="$RUNTIME_DIR/update-startup.confirmed"
+    ready="$ready_dir/ready"
+    mkdir -p "$ready_dir"
+    PENDING_VPSBOX_UPDATE_BACKUP="${CMD_PATH}.previous"
+    PENDING_VPSBOX_UPDATE_READY_FILE="$ready"
+    VPSBOX_UPDATE_STARTUP_CONFIRMED=0
+
+    confirm_pending_vpsbox_update
+    rollback_pending_vpsbox_update
+
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+    assert_file_contains "$CMD_PATH" 'remote'
+    assert_eq "" "$PENDING_VPSBOX_UPDATE_BACKUP"
+    assert_eq "" "$PENDING_VPSBOX_UPDATE_READY_FILE"
+    assert_eq 1 "$VPSBOX_UPDATE_STARTUP_CONFIRMED"
+    [ -f "$ready" ] || fail "确认新版启动时应通知父进程 watchdog"
+}
+
+test_stale_previous_without_handshake_is_ignored() {
+    reset_update_case startup-no-handshake
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
+    write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+    PENDING_VPSBOX_UPDATE_BACKUP=""
+    PENDING_VPSBOX_UPDATE_READY_FILE=""
+    VPSBOX_UPDATE_STARTUP_CONFIRMED=0
+
+    rollback_pending_vpsbox_update
+
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+    assert_file_contains "$CMD_PATH" 'remote'
+}
+
+test_pending_update_rejects_unexpected_backup_path() {
+    local ready_dir
+
+    reset_update_case startup-invalid-backup
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
+    write_fixture "$CASE_DIR/unexpected.previous" "$UPDATE_TEST_CURRENT" installed
+    ready_dir="$RUNTIME_DIR/update-startup.invalid"
+    mkdir -p "$ready_dir"
+    PENDING_VPSBOX_UPDATE_BACKUP="$CASE_DIR/unexpected.previous"
+    PENDING_VPSBOX_UPDATE_READY_FILE="$ready_dir/ready"
+    VPSBOX_UPDATE_STARTUP_CONFIRMED=0
+
+    if rollback_pending_vpsbox_update >"$TEST_TMP/invalid-backup.out" 2>&1; then
+        fail "启动回滚不得接受非 ${CMD_PATH}.previous 路径"
+    fi
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+    assert_file_contains "$TEST_TMP/invalid-backup.out" '拒绝使用非预期'
 }
 
 MOCK_SINGBOX_VERSION=""
@@ -236,6 +441,13 @@ main() {
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
         test_vpsbox_invalid_download_preserves_current
+        test_vpsbox_wrong_project_preserves_current
+        test_vpsbox_reexec_failure_restores_previous
+        test_pending_update_startup_failure_restores_previous
+        test_top_level_startup_failure_restores_previous
+        test_pending_update_confirmation_prevents_rollback
+        test_stale_previous_without_handshake_is_ignored
+        test_pending_update_rejects_unexpected_backup_path
         test_singbox_version_guards
     )
 

@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.21"
+VPSBOX_VERSION="v1.0.22"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -39,6 +39,8 @@ FIREWALL_ROLLBACK_SECONDS=90
 PACKAGE_CONNECT_TIMEOUT=15
 PACKAGE_UPDATE_TIMEOUT=120
 PACKAGE_INSTALL_TIMEOUT=600
+SYSTEM_UPGRADE_TIMEOUT=7200
+VPSBOX_UPDATE_STARTUP_TIMEOUT=60
 PACKAGE_KILL_GRACE=10
 PACKAGE_RETRY_MAX=2
 PACKAGE_RETRY_DELAY=2
@@ -56,6 +58,7 @@ ACTIVE_FIREWALL_TRANSITION_DIR=""
 ACTIVE_SSH_FIREWALL_TRANSITION=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
 ACTIVE_TRACE_TMP=""
+ACTIVE_UNAPPLIED_SSH_TRACKING=0
 ACTIVE_FAIL2BAN_TEST_IP=""
 ACTIVE_FAIL2BAN_TEST_BACKENDS=""
 SERVICE_NAME="sing-box"
@@ -83,6 +86,11 @@ TRACE_SIZE_LARGE=1400
 TRACE_SIZE_QUERIES=3
 REMOTE_VERSION=""
 UPDATE_AVAILABLE=0
+PENDING_VPSBOX_UPDATE_BACKUP="${VPSBOX_UPDATE_BACKUP:-}"
+PENDING_VPSBOX_UPDATE_READY_FILE="${VPSBOX_UPDATE_READY_FILE:-}"
+VPSBOX_UPDATE_STARTUP_CONFIRMED=0
+VPSBOX_UPDATE_WATCHDOG_PID=""
+VPSBOX_UPDATE_WATCHDOG_DIR=""
 FW_EXTRA_TCP=""
 FW_EXTRA_UDP=""
 FW_SSH_PORTS=""
@@ -158,7 +166,8 @@ run_bounded_in_new_session() {
     shift
     marker="$(mktemp /tmp/vpsbox-command-timeout.XXXXXX)" || return 1
     printf '%s\n' pending > "$marker"
-    setsid "$@" &
+    # 后台命令必须关闭菜单锁描述符；否则父菜单被 SIGKILL 后，子进程会继续占用 flock。
+    setsid "$@" 200>&- &
     pid=$!
 
     for i in {1..50}; do
@@ -194,7 +203,7 @@ run_bounded_in_new_session() {
             printf '%s\n' timeout > "$marker"
             terminate_bounded_session "$pid" "$PACKAGE_KILL_GRACE"
         fi
-    ) &
+    ) 200>&- &
     timer=$!
     ACTIVE_BOUNDED_TIMER_PID="$timer"
 
@@ -223,12 +232,14 @@ run_bounded_with_timeout() {
     local limit="$1" status
 
     shift
-    if timeout -k 1 1 true >/dev/null 2>&1; then
-        if timeout -k "$PACKAGE_KILL_GRACE" "$limit" "$@"; then return 0; else status=$?; fi
+    if timeout -k 1 1 true 200>&- >/dev/null 2>&1; then
+        if timeout -k "$PACKAGE_KILL_GRACE" "$limit" "$@" 200>&-; then return 0; else status=$?; fi
     else
-        # 兼容 BusyBox 1.35 之前不支持 timeout -k 的版本；主流程优先使用 setsid。
+        # 兼容 BusyBox 1.35 之前不支持 timeout -k 的版本；旧 Alpine 仍可能使用该实现，
+        # 因此保留普通 timeout 回退。两条 timeout 路径都必须关闭 FD 200，避免旧系统
+        # 在父菜单异常退出后由包管理子进程继续占用 vpsbox 菜单锁。
         warn "当前 timeout 不支持强制终止延迟，使用兼容模式。"
-        if timeout "$limit" "$@"; then return 0; else status=$?; fi
+        if timeout "$limit" "$@" 200>&-; then return 0; else status=$?; fi
     fi
     return "$status"
 }
@@ -596,13 +607,25 @@ cleanup_vpsbox_runtime() {
         cleanup_active_fail2ban_test ||
             warn "Fail2ban 测试地址自动解封失败，请按错误提示手动清理。"
     fi
+    if [ "${ACTIVE_UNAPPLIED_SSH_TRACKING:-0}" = "1" ] &&
+        declare -F cleanup_unapplied_ssh_tracking >/dev/null 2>&1; then
+        cleanup_unapplied_ssh_tracking 0 ||
+            warn "SSH 首次事务被中断，未能完整清理尚未应用的恢复基线。"
+    fi
     cleanup_active_trace_tmp
     cleanup_vpsbox_lock
+    if declare -F rollback_pending_vpsbox_update >/dev/null 2>&1; then
+        rollback_pending_vpsbox_update ||
+            warn "新版 vpsbox 启动失败，旧版脚本未能自动恢复，请检查 ${CMD_PATH}.previous。"
+    fi
 }
 
 install_lock_cleanup_traps() {
     trap cleanup_vpsbox_runtime EXIT
-    trap 'exit 0' HUP INT TERM QUIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 131' QUIT
 }
 
 lock_pid_from_file() {
@@ -610,7 +633,8 @@ lock_pid_from_file() {
     local pid=""
 
     [ -f "$path" ] || return 1
-    # 兼容早期仅写入 pid/started 的锁元数据；旧锁缺少进程身份字段时只能进入安全的人工确认路径。
+    # 兼容早期版本仅写入 pid/started 的锁元数据。升级后可能仍遇到旧锁文件，
+    # 但缺少 start_ticks/boot_id 时不能防止 PID 复用，因此只读取 PID 并进入人工确认路径。
     pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$path" 2>/dev/null || true)"
     if is_pid "$pid"; then
         printf '%s\n' "$pid"
@@ -819,6 +843,17 @@ ensure_curl() {
     return 1
 }
 
+vpsbox_script_identity_valid() {
+    local script="$1"
+
+    [ -f "$script" ] && [ ! -L "$script" ] || return 1
+    grep -Fqx 'APP_NAME="vpsbox"' "$script" || return 1
+    grep -Fqx 'SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' "$script" || return 1
+    grep -Fqx 'vpsbox_main() {' "$script" || return 1
+    grep -Fqx 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then' "$script" || return 1
+    grep -Fqx '    vpsbox_main "$@"' "$script" || return 1
+}
+
 download_vpsbox_script() {
     local dest="$1"
     local require_newer="${2:-0}"
@@ -850,6 +885,11 @@ download_vpsbox_script() {
     if ! grep -Eq '^VPSBOX_VERSION="v[0-9]+([.][0-9]+){2}"$' "$tmp"; then
         rm -f "$tmp"
         err "下载到的脚本缺少有效版本号，已保留当前版本。"
+        return 1
+    fi
+    if ! vpsbox_script_identity_valid "$tmp"; then
+        rm -f "$tmp"
+        err "下载到的脚本缺少 vpsbox 项目标识或必要入口，已保留当前版本。"
         return 1
     fi
     downloaded_version="$(sed -n 's/^VPSBOX_VERSION="\([^"]*\)"$/\1/p' "$tmp" | head -n 1)"
@@ -1029,7 +1069,12 @@ run_singbox_installer() {
         return 1
     fi
     case "$OS" in
-        debian) dpkg -i "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
+        debian)
+            run_bounded_command "$PACKAGE_INSTALL_TIMEOUT" \
+                env DEBIAN_FRONTEND=noninteractive \
+                dpkg --force-confdef --force-confold --install "$tmp" ||
+                { rm -rf "$tmp_dir"; return 1; }
+            ;;
         alpine) apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --allow-untrusted "$tmp" || { rm -rf "$tmp_dir"; return 1; } ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
@@ -1108,17 +1153,23 @@ ensure_change_store() {
 manifest_value() {
     local key="$1"
     ensure_change_store || return 1
-    awk -F= -v key="$key" '$1 == key && $2 ~ /^[A-Za-z0-9_.:-]+$/ { value=$2 } END { if (value != "") print value; else exit 1 }' "$CHANGE_MANIFEST"
+    # 值始终是单行 token；额外允许逗号保存已规范化的 SSH 多端口 CSV。
+    awk -F= -v key="$key" '$1 == key && $2 ~ /^[A-Za-z0-9_.:,-]+$/ { value=$2 } END { if (value != "") print value; else exit 1 }' "$CHANGE_MANIFEST"
 }
 
 manifest_set() {
     local key="$1" value="$2" tmp
-    [[ "$key" =~ ^[A-Z0-9_]+$ && "$value" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 1
+    [[ "$key" =~ ^[A-Z0-9_]+$ && "$value" =~ ^[A-Za-z0-9_.:,-]+$ ]] || return 1
     ensure_change_store || return 1
     tmp="$(mktemp "$VPSBOX_STATE_DIR/.changes.XXXXXX")" || return 1
-    awk -F= -v key="$key" '$1 != key { print }' "$CHANGE_MANIFEST" > "$tmp"
-    printf '%s=%s\n' "$key" "$value" >> "$tmp"
-    chown root:root "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$CHANGE_MANIFEST"
+    if ! awk -F= -v key="$key" '$1 != key { print }' "$CHANGE_MANIFEST" > "$tmp" ||
+        ! printf '%s=%s\n' "$key" "$value" >> "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$CHANGE_MANIFEST"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
 }
 
 manifest_set_once() {
@@ -1131,8 +1182,13 @@ manifest_remove() {
     [[ "$key" =~ ^[A-Z0-9_]+$ ]] || return 1
     ensure_change_store || return 1
     tmp="$(mktemp "$VPSBOX_STATE_DIR/.changes.XXXXXX")" || return 1
-    awk -F= -v key="$key" '$1 != key { print }' "$CHANGE_MANIFEST" > "$tmp"
-    chown root:root "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$CHANGE_MANIFEST"
+    if ! awk -F= -v key="$key" '$1 != key { print }' "$CHANGE_MANIFEST" > "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$CHANGE_MANIFEST"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
 }
 
 backup_change_file_once() {
@@ -1154,20 +1210,55 @@ mark_change_applied() {
 }
 
 restore_change_file() {
-    local name="$1" target="$2" state
+    local name="$1" target="$2" state backup tmp parent
     state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
     case "$state" in
-        file) cp -a "$CHANGE_BACKUP_DIR/$name" "$target" ;;
-        absent) rm -f "$target" ;;
+        file)
+            backup="$CHANGE_BACKUP_DIR/$name"
+            [ -f "$backup" ] && [ ! -L "$backup" ] || {
+                err "$name 的备份文件无效，已拒绝恢复。"
+                return 1
+            }
+            parent="$(dirname "$target")"
+            [ -d "$parent" ] && [ ! -L "$parent" ] || {
+                err "恢复目标目录无效或为符号链接：$parent"
+                return 1
+            }
+            tmp="$(mktemp "$parent/.vpsbox-restore.XXXXXX")" || return 1
+            if ! cp -a "$backup" "$tmp"; then
+                rm -f -- "$tmp"
+                return 1
+            fi
+            # 目标后来可能被系统组件改成符号链接；删除链接本身，避免覆盖其指向文件。
+            if [ -L "$target" ] && ! rm -f -- "$target"; then
+                rm -f -- "$tmp"
+                return 1
+            fi
+            if { [ -e "$target" ] && [ ! -f "$target" ]; } ||
+                ! mv -f -- "$tmp" "$target"; then
+                rm -f -- "$tmp"
+                return 1
+            fi
+            ;;
+        absent)
+            if [ -L "$target" ] || [ -f "$target" ]; then
+                rm -f -- "$target"
+            elif [ -e "$target" ]; then
+                err "恢复目标不是普通文件，已拒绝删除：$target"
+                return 1
+            fi
+            ;;
         *) warn "没有 $name 的可恢复备份。"; return 1 ;;
     esac
 }
 
 clear_change_tracking() {
-    local name="$1"
-    rm -f "$CHANGE_BACKUP_DIR/$name"
-    manifest_remove "BACKUP_$name"
-    manifest_remove "APPLIED_$name"
+    local name="$1" failed=0
+
+    rm -f "$CHANGE_BACKUP_DIR/$name" || failed=1
+    manifest_remove "BACKUP_$name" || failed=1
+    manifest_remove "APPLIED_$name" || failed=1
+    return "$failed"
 }
 
 install_deps() {
@@ -1344,6 +1435,11 @@ singbox_config_pids() {
         pid="${proc##*/}"
         [ "$pid" != "$$" ] || continue
         exe="$(readlink "$proc/exe" 2>/dev/null || true)"
+        # Linux 会给仍在运行但磁盘文件已被升级/删除的程序追加 " (deleted)"；
+        # 只剥离该精确后缀，并继续核对可执行文件名及完整配置参数，避免扩大进程匹配范围。
+        case "$exe" in
+            *' (deleted)') exe="${exe% (deleted)}" ;;
+        esac
         [ "${exe##*/}" = "sing-box" ] || continue
         mapfile -d '' -t args < "$proc/cmdline" 2>/dev/null || true
         [ "${#args[@]}" -ge 4 ] || continue
@@ -1724,20 +1820,19 @@ is_ipv4_address() {
 
     for part in "${parts[@]}"; do
         [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        [ "${#part}" -eq 1 ] || [[ "$part" != 0* ]] || return 1
         ((10#$part <= 255)) || return 1
     done
 }
 
 is_ipv6_address_basic() {
     local ip="$1"
-    local no_colons
-    local colon_count
-    local without_double
-    local double_count
     local check_ip
     local maybe_v4
-    local rest
-    local chunk
+    local left right
+    local side segment
+    local units=0
+    local -a chunks
 
     [[ "$ip" == *:* ]] || return 1
     [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
@@ -1745,34 +1840,37 @@ is_ipv6_address_basic() {
     [[ "$ip" != :[^:]* ]] || return 1
     [[ "$ip" != *[^:]: ]] || return 1
 
-    without_double="${ip//::/}"
-    double_count=$(((${#ip} - ${#without_double}) / 2))
-    [ "$double_count" -le 1 ] || return 1
-
-    maybe_v4="${ip##*:}"
     check_ip="$ip"
-    if [[ "$maybe_v4" == *.* ]]; then
+    if [[ "$check_ip" == *.* ]]; then
+        maybe_v4="${check_ip##*:}"
         is_ipv4_address "$maybe_v4" || return 1
-        check_ip="${ip%:*}:0"
+        check_ip="${check_ip%"$maybe_v4"}0:0"
     fi
 
-    no_colons="${check_ip//:/}"
-    colon_count=$((${#check_ip} - ${#no_colons}))
-    [ "$colon_count" -ge 2 ] || return 1
-    [ "$colon_count" -le 7 ] || return 1
-    if [[ "$check_ip" != *::* ]] && [ "$colon_count" -ne 7 ]; then
-        return 1
+    if [[ "$check_ip" == *::* ]]; then
+        right="${check_ip#*::}"
+        [[ "$right" != *::* ]] || return 1
+        left="${check_ip%%::*}"
+        for side in "$left" "$right"; do
+            [ -n "$side" ] || continue
+            IFS=: read -r -a chunks <<< "$side"
+            for segment in "${chunks[@]}"; do
+                [[ "$segment" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+                units=$((units + 1))
+            done
+        done
+        # "::" 必须压缩至少一个 16 位段；七个显式段加边缘压缩仍是合法地址。
+        [ "$units" -lt 8 ]
+    else
+        IFS=: read -r -a chunks <<< "$check_ip"
+        [ "${#chunks[@]}" -eq 8 ] || return 1
+        for segment in "${chunks[@]}"; do
+            if [[ ! "$segment" =~ ^[0-9A-Fa-f]{1,4}$ ]]; then
+                return 1
+            fi
+        done
+        return 0
     fi
-
-    rest="$check_ip"
-    while [[ "$rest" == *:* ]]; do
-        chunk="${rest%%:*}"
-        if [ -n "$chunk" ] && [[ ! "$chunk" =~ ^[0-9A-Fa-f]{1,4}$ ]]; then
-            return 1
-        fi
-        rest="${rest#*:}"
-    done
-    [ -z "$rest" ] || [[ "$rest" =~ ^[0-9A-Fa-f]{1,4}$ ]]
 }
 
 is_ip_address() {
@@ -1871,27 +1969,37 @@ url_encode_userinfo() {
 }
 
 generate_link() {
-    load_state
     local host
     local encoded
-    host="$(uri_host "${DOMAIN:-}")"
+
+    load_state || return 1
+    host="$(uri_host "${DOMAIN:-}")" || return 1
     case "${PROTOCOL:-shadowsocks}" in
         shadowsocks)
-            encoded="$(url_encode_userinfo "${METHOD:-$METHOD}:${PASSWORD:-}")"
-            echo "ss://${encoded}@${host}:${PORT:-0}#${NAME:-ss}"
+            encoded="$(url_encode_userinfo "${METHOD:-$METHOD}:${PASSWORD:-}")" || return 1
+            printf 'ss://%s@%s:%s#%s\n' "$encoded" "$host" "${PORT:-0}" "${NAME:-ss}"
             ;;
         vless-reality)
-            echo "vless://${UUID}@${host}:${PORT}?encryption=none&flow=${FLOW}&security=reality&sni=${REALITY_SERVER_NAME}&fp=${FINGERPRINT}&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp#${NAME}"
+            printf 'vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp#%s\n' \
+                "$UUID" "$host" "$PORT" "$FLOW" "$REALITY_SERVER_NAME" "$FINGERPRINT" \
+                "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$NAME"
             ;;
         *) return 1 ;;
     esac
 }
 
 write_uri_file() {
+    local tmp
+
     secure_config_dir || return 1
-    generate_link > "$URI_FILE"
-    chown root:root "$URI_FILE" || return 1
-    chmod 600 "$URI_FILE" || return 1
+    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-uri.XXXXXX")" || return 1
+    if ! generate_link > "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$URI_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
 }
 
 backup_node_files() {
@@ -2089,8 +2197,23 @@ random_trace_source_port() {
     return 1
 }
 
+normalize_port_decimal() {
+    local port="${1:-}" normalized
+
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    normalized="${port#"${port%%[!0]*}"}"
+    [ -n "$normalized" ] || normalized=0
+    [ "${#normalized}" -le 5 ] || return 1
+    [ "$normalized" -ge 1 ] && [ "$normalized" -le 65535 ] || return 1
+    printf '%s\n' "$normalized"
+}
+
 is_valid_port() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+    local normalized
+
+    normalized="$(normalize_port_decimal "${1:-}")" || return 1
+    # 交互输入使用规范十进制，避免 00080 进入 JSON、状态文件或 nftables 后产生不同表示。
+    [ "$normalized" = "$1" ]
 }
 
 port_is_effective_ssh_port() {
@@ -2318,11 +2441,16 @@ generate_reality_keypair() {
 
 check_reality_server() {
     local server_name="$1"
+
     is_domain_name "$server_name" || return 1
     resolve_host_ips "$server_name" | grep -q . || return 1
-    if command -v openssl >/dev/null 2>&1; then
-        timeout 12 openssl s_client -connect "${server_name}:443" -servername "$server_name" </dev/null >/dev/null 2>&1 || return 1
-    fi
+    command -v openssl >/dev/null 2>&1 || {
+        err "未找到 openssl，无法验证 Reality 目标的 TLS 443。"
+        return 1
+    }
+    run_bounded_command 12 openssl s_client \
+        -connect "${server_name}:443" -servername "$server_name" \
+        </dev/null >/dev/null 2>&1
 }
 
 setup_service() {
@@ -2396,16 +2524,29 @@ create_or_rebuild_node() {
         err "备份当前节点失败，已取消重建。"
         return 1
     fi
+    # 从安装 sing-box 前就纳入节点事务：官方包可能预先写入 config.json。
+    # 取消、EOF 或 Ctrl+C 时只恢复节点文件和服务状态，不卸载用户原有或本次安装的 sing-box。
+    ACTIVE_NODE_BACKUP="$backup_dir"
 
     if node_exists; then
         existing_port="$PORT"
         warn "检测到已有节点。"
-        read -r -p "是否覆盖重建？(y/N): " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || { cleanup_node_backup "$backup_dir"; info "已取消。"; return 0; }
+        if ! read -r -p "是否覆盖重建？(y/N): " confirm; then
+            ACTIVE_NODE_BACKUP=""
+            cleanup_node_backup "$backup_dir"
+            info "输入已结束，已取消。"
+            return 1
+        fi
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            ACTIVE_NODE_BACKUP=""
+            cleanup_node_backup "$backup_dir"
+            info "已取消。"
+            return 0
+        fi
     fi
 
     if ! install_singbox_if_missing; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "sing-box 安装失败，未创建新节点。"
         return 1
     fi
@@ -2419,7 +2560,8 @@ create_or_rebuild_node() {
     local password
 
     while true; do
-        read -r -p "请输入节点域名或 IP：" input_host || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
+        read -r -p "请输入节点域名或 IP：" input_host ||
+            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
         domain="$(normalize_host "$input_host")"
         if [ -z "$domain" ]; then
             err "节点域名或 IP 不能为空，请重新输入。"
@@ -2440,7 +2582,8 @@ create_or_rebuild_node() {
 
     default_name="$(default_name_for_host "$domain")"
     while true; do
-        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name ||
+            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
         input_name="$(sanitize_paste_input "$input_name")"
         if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
             err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
@@ -2453,7 +2596,7 @@ create_or_rebuild_node() {
     done
 
     if ! port="$(choose_node_port "$existing_port")"; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "节点端口选择失败，未创建新节点。"
         return 1
     fi
@@ -2469,7 +2612,7 @@ create_or_rebuild_node() {
 ----------------------------------------
 EOF
     if ! confirm_default_yes "确认无误并创建？"; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         info "已取消，未修改当前节点。"
         return 0
     fi
@@ -2478,10 +2621,8 @@ EOF
 
     info "加密方式：$METHOD"
     info "正在写入配置..."
-    ACTIVE_NODE_BACKUP="$backup_dir"
     if ! firewall_prepare_port_transition "$port" "$port"; then
-        ACTIVE_NODE_BACKUP=""
-        cleanup_node_backup "$backup_dir"
+        rollback_active_node_transaction || true
         err "主机防火墙无法临时放行新节点端口，未创建节点。"
         return 1
     fi
@@ -2530,7 +2671,10 @@ EOF
     cleanup_node_backup "$backup_dir"
 
     info "创建完成，节点链接如下："
-    view_node_link
+    if ! view_node_link; then
+        err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
+        return 1
+    fi
 }
 
 create_vless_reality_node() {
@@ -2545,22 +2689,36 @@ create_vless_reality_node() {
         err "备份当前节点失败，已取消重建。"
         return 1
     fi
+    # 与 SS 流程保持同一事务边界，兼容官方包首次安装即创建默认 config.json 的行为。
+    # 回滚只清理/恢复节点文件与服务状态，不会卸载安装前已存在的 sing-box。
+    ACTIVE_NODE_BACKUP="$backup_dir"
 
     if node_exists; then
         existing_port="$PORT"
         warn "检测到已有 ${PROTOCOL:-shadowsocks} 节点。"
-        read -r -p "创建 VLESS Reality 将替换当前节点，是否继续？(y/N): " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || { cleanup_node_backup "$backup_dir"; info "已取消。"; return 0; }
+        if ! read -r -p "创建 VLESS Reality 将替换当前节点，是否继续？(y/N): " confirm; then
+            ACTIVE_NODE_BACKUP=""
+            cleanup_node_backup "$backup_dir"
+            info "输入已结束，已取消。"
+            return 1
+        fi
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            ACTIVE_NODE_BACKUP=""
+            cleanup_node_backup "$backup_dir"
+            info "已取消。"
+            return 0
+        fi
     fi
 
     if ! install_singbox_if_missing; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "sing-box 安装失败，未创建新节点。"
         return 1
     fi
 
     while true; do
-        read -r -p "请输入节点连接地址（域名或 IP）：" input_host || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
+        read -r -p "请输入节点连接地址（域名或 IP）：" input_host ||
+            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
         domain="$(normalize_host "$input_host")"
         if ! is_valid_node_host "$domain"; then
             err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
@@ -2578,7 +2736,8 @@ create_vless_reality_node() {
     default_name="$(default_name_for_host "$domain")"
     default_name="vless-${default_name#ss-}"
     while true; do
-        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name ||
+            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
         input_name="$(sanitize_paste_input "$input_name")"
         if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
             err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
@@ -2591,7 +2750,8 @@ create_vless_reality_node() {
     done
 
     while true; do
-        read -r -p "请输入 Reality 目标域名/SNI（留空默认 ${DEFAULT_REALITY_SERVER_NAME}）：" input_sni || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
+        read -r -p "请输入 Reality 目标域名/SNI（留空默认 ${DEFAULT_REALITY_SERVER_NAME}）：" input_sni ||
+            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
         server_name="$(normalize_host "${input_sni:-$DEFAULT_REALITY_SERVER_NAME}")"
         if ! is_domain_name "$server_name"; then
             err "Reality 目标必须是有效域名，不能使用 IP 地址。"
@@ -2606,7 +2766,7 @@ create_vless_reality_node() {
     done
 
     if ! port="$(choose_node_port "$existing_port")"; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "节点端口选择失败，未创建新节点。"
         return 1
     fi
@@ -2623,19 +2783,19 @@ create_vless_reality_node() {
 ----------------------------------------
 EOF
     if ! confirm_default_yes "确认无误并创建？"; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         info "已取消，未修改当前节点。"
         return 0
     fi
     uuid="$(sing-box generate uuid 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "UUID 生成失败，未创建新节点。"
         return 1
     fi
     mapfile -t keypair < <(generate_reality_keypair) || true
     if [ "${#keypair[@]}" -ne 2 ]; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "Reality 密钥生成失败，未创建新节点。"
         return 1
     fi
@@ -2643,16 +2803,14 @@ EOF
     public_key="${keypair[1]}"
     short_id="$(sing-box generate rand 8 --hex 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$short_id" =~ ^[0-9A-Fa-f]{16}$ ]]; then
-        cleanup_node_backup "$backup_dir"
+        rollback_node_files_transaction || true
         err "Reality Short ID 生成失败，未创建新节点。"
         return 1
     fi
 
     info "正在写入 VLESS Reality 配置..."
-    ACTIVE_NODE_BACKUP="$backup_dir"
     if ! firewall_prepare_port_transition "$port" ""; then
-        ACTIVE_NODE_BACKUP=""
-        cleanup_node_backup "$backup_dir"
+        rollback_active_node_transaction || true
         err "主机防火墙无法临时放行新节点端口，未创建节点。"
         return 1
     fi
@@ -2686,18 +2844,33 @@ EOF
     ACTIVE_NODE_BACKUP=""
     cleanup_node_backup "$backup_dir"
     info "创建完成，节点链接如下："
-    view_node_link
+    if ! view_node_link; then
+        err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
+        return 1
+    fi
 }
 
 view_node_link() {
+    local uri
+
     require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有已创建的节点。"
         return 0
     fi
 
-    load_state
-    write_uri_file
+    load_state || {
+        err "节点状态文件读取失败，无法生成链接。"
+        return 1
+    }
+    write_uri_file || {
+        err "节点链接生成或写入失败。"
+        return 1
+    }
+    uri="$(cat "$URI_FILE")" || {
+        err "节点链接文件读取失败。"
+        return 1
+    }
 
     if [ "$PROTOCOL" = "vless-reality" ]; then
         cat <<EOF
@@ -2709,7 +2882,7 @@ view_node_link() {
  流控：${FLOW}
 ----------------------------------------
  链接：
- $(cat "$URI_FILE")
+ $uri
 ========================================
 EOF
         return 0
@@ -2724,7 +2897,7 @@ EOF
  密码：${PASSWORD}
 ----------------------------------------
  链接：
- $(cat "$URI_FILE")
+ $uri
 ========================================
 EOF
 }
@@ -2798,9 +2971,36 @@ delete_node() {
     info "当前节点已删除，sing-box 服务已停止并禁用开机启动。"
 }
 
+restore_singbox_update_backup() {
+    local binary_path="$1" backup_binary="$2" backup_dir="$3"
+    local was_enabled="$4" was_active="$5"
+    local failed=0
+
+    service_stop 2>/dev/null || true
+    stop_singbox_config_processes 2>/dev/null || true
+    if ! cp -a -- "$backup_binary" "$binary_path"; then
+        err "旧 sing-box 二进制恢复失败：$backup_binary"
+        failed=1
+    fi
+    hash -r
+    if [ "$failed" -eq 0 ] && node_exists && ! setup_service; then
+        err "旧 sing-box 服务配置恢复失败。"
+        failed=1
+    fi
+    if [ "$failed" -eq 0 ] &&
+        ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+        err "旧 sing-box 二进制已恢复，但原服务状态恢复失败。"
+        failed=1
+    fi
+
+    # 更新失败时保留本地二进制备份，避免包管理器处于异常状态后失去最后恢复副本。
+    warn "sing-box 更新备份已保留：$backup_dir"
+    [ "$failed" -eq 0 ]
+}
+
 update_singbox() {
     local binary_path backup_dir backup_binary old_version
-    local relation
+    local relation new_version
     local was_active=0 was_enabled=0
 
     if ! singbox_installed; then
@@ -2840,44 +3040,209 @@ update_singbox() {
 
     if ! install_deps; then
         rm -rf "$backup_dir"
+        err "更新依赖准备失败；sing-box 二进制和服务状态均未修改。"
         return 1
     fi
     info "正在更新 sing-box..."
     if ! run_singbox_installer; then
-        rm -rf "$backup_dir"
+        err "sing-box 安装过程失败，正在恢复旧二进制和原服务状态。"
+        restore_singbox_update_backup \
+            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+        return 1
+    fi
+
+    new_version="$(singbox_version)"
+    if [ "$new_version" != "$SINGBOX_RELEASE_VERSION" ]; then
+        err "安装后的 sing-box 版本异常（当前：$new_version），正在恢复旧版本。"
+        restore_singbox_update_backup \
+            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
         return 1
     fi
 
     if node_exists; then
         if ! sing-box check -c "$CONFIG_PATH" >/dev/null; then
             err "当前节点配置未通过新版 sing-box 检查，正在恢复旧二进制。"
-            if ! run_singbox_installer "$old_version"; then
-                cp -a "$backup_binary" "$binary_path" || err "恢复旧二进制失败：$backup_binary"
-            fi
-            restore_singbox_service_state "$was_enabled" "$was_active" 2>/dev/null || warn "旧版 sing-box 已恢复，但原服务状态恢复失败。"
-            rm -rf "$backup_dir"
+            restore_singbox_update_backup \
+                "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
             return 1
         fi
         if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active"; then
             err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
-            service_stop 2>/dev/null || true
-            if ! run_singbox_installer "$old_version" && ! cp -a "$backup_binary" "$binary_path"; then
-                err "恢复旧版 sing-box 失败：$backup_binary"
-                rm -rf "$backup_dir"
-                return 1
-            fi
-            if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active"; then
-                err "旧版 sing-box 已恢复，但原服务状态恢复失败。"
-                rm -rf "$backup_dir"
-                return 1
-            fi
-            rm -rf "$backup_dir"
+            restore_singbox_update_backup \
+                "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
             return 1
         fi
+    elif ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+        err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
+        restore_singbox_update_backup \
+            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+        return 1
     fi
 
     rm -rf "$backup_dir"
     info "更新完成：$(singbox_version)"
+}
+
+restore_previous_vpsbox() {
+    local backup="$1"
+    local tmp
+
+    [ -f "$backup" ] && [ ! -L "$backup" ] || {
+        err "未找到可用的旧版备份：$backup"
+        return 1
+    }
+    if ! bash -n "$backup" >/dev/null 2>&1 ||
+        ! vpsbox_script_identity_valid "$backup"; then
+        err "旧版备份未通过语法或项目身份检查：$backup"
+        return 1
+    fi
+    tmp="$(mktemp "$(dirname "$CMD_PATH")/.vpsbox-restore.XXXXXX")" || return 1
+    if ! cp -a -- "$backup" "$tmp" ||
+        ! chmod 755 "$tmp" ||
+        ! mv -f -- "$tmp" "$CMD_PATH"; then
+        rm -f -- "$tmp"
+        err "旧版 vpsbox 恢复失败，备份仍保留在：$backup"
+        return 1
+    fi
+    install_command_alias
+    info "已从 $backup 恢复旧版 vpsbox。"
+}
+
+vpsbox_update_ready_path_valid() {
+    local ready="$1" dir
+
+    [ -n "$ready" ] || return 1
+    dir="${ready%/ready}"
+    [ "$ready" = "$dir/ready" ] || return 1
+    [[ "$dir" == "$RUNTIME_DIR"/update-startup.* ]] || return 1
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ ! -L "$ready" ]
+}
+
+mark_vpsbox_update_ready() {
+    local ready="$1" dir tmp
+
+    vpsbox_update_ready_path_valid "$ready" || return 1
+    dir="${ready%/ready}"
+    tmp="$(mktemp "$dir/.ready.XXXXXX")" || return 1
+    if ! printf '%s\n' "$$" > "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$ready"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+start_vpsbox_update_watchdog() {
+    local backup="$1" dir ready owner_pid owner_start
+
+    # v1.0.22 起由旧进程先启动独立 watchdog，再 exec 新脚本。这样即使候选脚本
+    # 在解析完毕后、进入 vpsbox_main 之前顶层退出，也能依据 PID 启动时间恢复 .previous。
+    [ "$backup" = "${CMD_PATH}.previous" ] || return 1
+    if [ ! -f "$backup" ] || [ -L "$backup" ] ||
+        ! bash -n "$backup" >/dev/null 2>&1 ||
+        ! vpsbox_script_identity_valid "$backup"; then
+        return 1
+    fi
+    [ -d "$RUNTIME_DIR" ] && [ ! -L "$RUNTIME_DIR" ] || return 1
+    dir="$(mktemp -d "$RUNTIME_DIR/update-startup.XXXXXX")" || return 1
+    chmod 700 "$dir" || { rm -rf -- "$dir"; return 1; }
+    ready="$dir/ready"
+    owner_pid="$$"
+    owner_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+    [[ "$owner_start" =~ ^[0-9]+$ ]] || { rm -rf -- "$dir"; return 1; }
+
+    (
+        local elapsed=0 current_start i
+
+        trap - EXIT HUP INT TERM QUIT
+        while [ "$elapsed" -lt "$VPSBOX_UPDATE_STARTUP_TIMEOUT" ]; do
+            if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+                rm -rf -- "$dir"
+                exit 0
+            fi
+            current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+            [ "$current_start" = "$owner_start" ] || break
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+
+        if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+            rm -rf -- "$dir"
+            exit 0
+        fi
+        current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+        if [ "$current_start" = "$owner_start" ]; then
+            kill -TERM "$owner_pid" 2>/dev/null || true
+            for i in 1 2 3 4 5; do
+                sleep 1
+                current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+                [ "$current_start" = "$owner_start" ] || break
+            done
+            [ "$current_start" != "$owner_start" ] ||
+                kill -KILL "$owner_pid" 2>/dev/null || true
+        fi
+        if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+            rm -rf -- "$dir"
+            exit 0
+        fi
+        if restore_previous_vpsbox "$backup"; then
+            if [ -w /dev/tty ]; then
+                printf '\n[WARN] 新版 vpsbox 未完成启动，已自动恢复旧版。\n' >/dev/tty 2>/dev/null || true
+            fi
+            rm -rf -- "$dir"
+        else
+            printf '%s\n' "restore_failed=1" > "$dir/restore-failed" 2>/dev/null || true
+            if [ -w /dev/tty ]; then
+                printf '\n[ERR] 新版 vpsbox 启动失败，且旧版自动恢复失败：%s\n' "$backup" >/dev/tty 2>/dev/null || true
+            fi
+        fi
+    ) 200>&- </dev/null >>"$dir/watchdog.log" 2>&1 &
+    VPSBOX_UPDATE_WATCHDOG_PID=$!
+    VPSBOX_UPDATE_WATCHDOG_DIR="$dir"
+}
+
+rollback_pending_vpsbox_update() {
+    local backup="${PENDING_VPSBOX_UPDATE_BACKUP:-}"
+    local ready="${PENDING_VPSBOX_UPDATE_READY_FILE:-}"
+
+    [ -n "$backup$ready" ] || return 0
+    [ "${VPSBOX_UPDATE_STARTUP_CONFIRMED:-0}" != "1" ] || return 0
+    PENDING_VPSBOX_UPDATE_BACKUP=""
+    PENDING_VPSBOX_UPDATE_READY_FILE=""
+    unset VPSBOX_UPDATE_BACKUP || true
+    unset VPSBOX_UPDATE_READY_FILE || true
+
+    # 兼容旧版本遗留的 .previous：旧备份本身不能证明本次启动来自更新，
+    # 因此没有一次性更新握手变量时绝不自动回退，避免普通启动误用陈旧备份。
+    [ "$backup" = "${CMD_PATH}.previous" ] || {
+        err "拒绝使用非预期的 vpsbox 更新备份路径：$backup"
+        return 1
+    }
+    vpsbox_update_ready_path_valid "$ready" || {
+        err "拒绝使用无效的 vpsbox 更新握手路径：$ready"
+        return 1
+    }
+    err "新版 vpsbox 未完成首次界面启动，正在恢复旧版脚本。"
+    if restore_previous_vpsbox "$backup"; then
+        mark_vpsbox_update_ready "$ready" || true
+        return 0
+    fi
+    return 1
+}
+
+confirm_pending_vpsbox_update() {
+    local ready="${PENDING_VPSBOX_UPDATE_READY_FILE:-}"
+
+    [ -n "${PENDING_VPSBOX_UPDATE_BACKUP:-}$ready" ] || return 0
+    if ! mark_vpsbox_update_ready "$ready"; then
+        err "无法确认新版 vpsbox 启动状态，已触发安全回滚。"
+        return 1
+    fi
+    VPSBOX_UPDATE_STARTUP_CONFIRMED=1
+    PENDING_VPSBOX_UPDATE_BACKUP=""
+    PENDING_VPSBOX_UPDATE_READY_FILE=""
+    unset VPSBOX_UPDATE_BACKUP || true
+    unset VPSBOX_UPDATE_READY_FILE || true
 }
 
 update_vpsbox() {
@@ -2915,7 +3280,8 @@ update_vpsbox() {
     fi
     if ! mv -f "$candidate" "$CMD_PATH"; then
         rm -f "$candidate"
-        err "替换 vpsbox 脚本失败，已保留当前版本。"
+        err "替换 vpsbox 脚本失败，正在从备份恢复。"
+        [ ! -f "$backup" ] || restore_previous_vpsbox "$backup" || true
         return 1
     fi
     install_command_alias
@@ -2923,16 +3289,33 @@ update_vpsbox() {
     info "vpsbox 已更新；旧版本备份：$backup"
     info "正在重新打开新版管理面板..."
     cleanup_vpsbox_lock
-    reexec_updated_vpsbox || {
+    reexec_updated_vpsbox "$backup" || {
         status=$?
-        err "无法重新打开新版管理面板，正在恢复当前菜单运行锁。"
-        acquire_lock
+        err "无法重新打开新版管理面板，正在恢复旧版脚本。"
+        if ! restore_previous_vpsbox "$backup"; then
+            err "自动恢复失败；请使用备份手动恢复：$backup"
+        fi
+        acquire_lock || true
         return "$status"
     }
 }
 
 reexec_updated_vpsbox() {
-    exec "$CMD_PATH"
+    local backup="$1" ready status watchdog_pid
+
+    start_vpsbox_update_watchdog "$backup" || {
+        err "无法启动新版 vpsbox 启动监护，已取消切换。"
+        return 1
+    }
+    ready="$VPSBOX_UPDATE_WATCHDOG_DIR/ready"
+    watchdog_pid="$VPSBOX_UPDATE_WATCHDOG_PID"
+    VPSBOX_UPDATE_BACKUP="$backup" VPSBOX_UPDATE_READY_FILE="$ready" exec "$CMD_PATH"
+    status=$?
+    mark_vpsbox_update_ready "$ready" || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    VPSBOX_UPDATE_WATCHDOG_PID=""
+    VPSBOX_UPDATE_WATCHDOG_DIR=""
+    return "$status"
 }
 
 bbr_state() {
@@ -3518,25 +3901,265 @@ write_chrony_sources() {
     fi
 
     if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
-        mkdir -p /etc/chrony/sources.d
-        cat > "$source_file" <<EOF
+        mkdir -p /etc/chrony/sources.d || return 1
+        if ! cat > "$source_file" <<EOF
 pool time.cloudflare.com iburst maxsources 4
 pool pool.ntp.org iburst maxsources 4
 EOF
-        remove_vpsbox_ntp_block "$conf"
+        then
+            return 1
+        fi
+        remove_vpsbox_ntp_block "$conf" || return 1
         info "已写入 NTP 源：$source_file"
     else
-        remove_vpsbox_ntp_block "$conf"
-        cat >> "$conf" <<EOF
+        remove_vpsbox_ntp_block "$conf" || return 1
+        if ! cat >> "$conf" <<EOF
 
 $NTP_SOURCES_BEGIN
 pool time.cloudflare.com iburst maxsources 4
 pool pool.ntp.org iburst maxsources 4
 $NTP_SOURCES_END
 EOF
-        rm -f "$source_file" 2>/dev/null || true
+        then
+            return 1
+        fi
+        rm -f "$source_file" || return 1
         info "已写入 NTP 源：$conf"
     fi
+}
+
+systemd_unit_exists() {
+    local unit="$1"
+
+    systemctl list-unit-files "$unit" 2>/dev/null | grep -q "^${unit//./\\.}"
+}
+
+ntp_package_installed() {
+    local package="$1"
+
+    case "$OS" in
+        debian)
+            dpkg-query -W -f='${Status}\n' "$package" 2>/dev/null |
+                grep -qx 'install ok installed'
+            ;;
+        redhat)
+            rpm -q "$package" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+restore_ntp_packages_to_state() {
+    local chrony_state="$1" timesyncd_state="${2:-}" failed=0
+
+    case "$chrony_state" in installed|absent) ;; *) return 1 ;; esac
+    case "$OS" in
+        debian)
+            case "$timesyncd_state" in installed|absent) ;; *) return 1 ;; esac
+            export DEBIAN_FRONTEND=noninteractive
+            if [ "$chrony_state" = "absent" ]; then
+                if ntp_package_installed chrony &&
+                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" purge -y chrony; then
+                    failed=1
+                fi
+                if [ "$timesyncd_state" = "installed" ]; then
+                    ntp_package_installed systemd-timesyncd ||
+                        apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y systemd-timesyncd ||
+                        failed=1
+                elif ntp_package_installed systemd-timesyncd &&
+                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" purge -y systemd-timesyncd; then
+                    failed=1
+                fi
+            else
+                ntp_package_installed chrony ||
+                    apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony ||
+                    failed=1
+                if [ "$timesyncd_state" = "absent" ] &&
+                    ntp_package_installed systemd-timesyncd &&
+                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" purge -y systemd-timesyncd; then
+                    failed=1
+                fi
+            fi
+            ;;
+        redhat)
+            if [ "$chrony_state" = "installed" ] && ! ntp_package_installed chrony; then
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony || failed=1
+                else
+                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony || failed=1
+                fi
+            elif [ "$chrony_state" = "absent" ] && ntp_package_installed chrony; then
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y chrony || failed=1
+                else
+                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y chrony || failed=1
+                fi
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    return "$failed"
+}
+
+restore_ntp_unit_state() {
+    local unit="$1" existed="$2" enabled="$3" active="$4"
+
+    if [ "$existed" = "absent" ]; then
+        if systemd_unit_exists "${unit}.service"; then
+            systemctl disable --now "$unit" >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    fi
+    [ "$existed" = "present" ] || return 1
+    systemd_unit_exists "${unit}.service" || return 1
+    if [ "$enabled" = "enabled" ]; then
+        systemctl enable "$unit" >/dev/null || return 1
+    else
+        systemctl disable "$unit" >/dev/null || return 1
+    fi
+    if [ "$active" = "active" ]; then
+        systemctl start "$unit" >/dev/null || return 1
+    else
+        systemctl stop "$unit" >/dev/null || return 1
+    fi
+}
+
+restore_ntp_snapshot_file() {
+    local snapshot_dir="$1" name="$2" target="$3"
+
+    if [ -f "$snapshot_dir/$name.present" ]; then
+        [ -f "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ] || return 1
+        if [ -L "$target" ]; then
+            rm -f -- "$target" || return 1
+        elif [ -e "$target" ] && [ ! -f "$target" ]; then
+            return 1
+        fi
+        cp -a "$snapshot_dir/$name" "$target"
+    elif [ -f "$snapshot_dir/$name.absent" ]; then
+        if [ -L "$target" ] || [ -f "$target" ]; then
+            rm -f -- "$target"
+        elif [ -e "$target" ]; then
+            return 1
+        fi
+    else
+        return 1
+    fi
+}
+
+cleanup_ntp_snapshot() {
+    local snapshot_dir="$1"
+
+    [[ "$snapshot_dir" == /tmp/vpsbox-chrony.* ]] &&
+        [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    rm -rf -- "$snapshot_dir"
+}
+
+rollback_ntp_runtime_state() {
+    local snapshot_dir="$1" conf="$2" source_file="$3" svc="$4"
+    local chrony_package="$5" timesyncd_package="$6"
+    local chrony_unit="$7" chrony_enabled="$8" chrony_active="$9"
+    local timesyncd_unit="${10}" timesyncd_enabled="${11}" timesyncd_active="${12}"
+    local failed=0
+
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    restore_ntp_packages_to_state "$chrony_package" "$timesyncd_package" || failed=1
+    restore_ntp_snapshot_file "$snapshot_dir" conf "$conf" || failed=1
+    restore_ntp_snapshot_file "$snapshot_dir" sources "$source_file" || failed=1
+    restore_ntp_unit_state "$svc" "$chrony_unit" "$chrony_enabled" "$chrony_active" ||
+        failed=1
+    restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active" || failed=1
+    return "$failed"
+}
+
+clear_ntp_change_tracking() {
+    local key failed=0
+
+    clear_change_tracking NTP_CONF || failed=1
+    clear_change_tracking NTP_SOURCES || failed=1
+    for key in NTP_CHRONY_ACTIVE NTP_CHRONY_ENABLED NTP_CHRONY_PACKAGE \
+        NTP_CHRONY_UNIT NTP_TIMESYNCD_ACTIVE NTP_TIMESYNCD_ENABLED \
+        NTP_TIMESYNCD_PACKAGE NTP_TIMESYNCD_UNIT; do
+        manifest_remove "$key" || failed=1
+    done
+    return "$failed"
+}
+
+settle_failed_ntp_change() {
+    local snapshot_dir="$1" conf="$2" source_file="$3" svc="$4"
+    local chrony_package="$5" timesyncd_package="$6"
+    local chrony_unit="$7" chrony_enabled="$8" chrony_active="$9"
+    local timesyncd_unit="${10}" timesyncd_enabled="${11}" timesyncd_active="${12}"
+    local applied_before="${13}"
+
+    if ! rollback_ntp_runtime_state "$snapshot_dir" "$conf" "$source_file" "$svc" \
+        "$chrony_package" "$timesyncd_package" \
+        "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active"; then
+        err "NTP 原状态未能完整恢复；恢复记录与临时快照已保留：$snapshot_dir"
+        return 1
+    fi
+    cleanup_ntp_snapshot "$snapshot_dir" ||
+        warn "NTP 已回滚，但临时快照清理失败：$snapshot_dir"
+    if [ "$applied_before" != "1" ] && ! clear_ntp_change_tracking; then
+        warn "NTP 已回滚，但变更清单清理失败；恢复菜单仍会保留该项目。"
+        return 1
+    fi
+}
+
+restore_recorded_ntp_change() {
+    local svc chrony_package timesyncd_package chrony_unit timesyncd_unit
+    local chrony_enabled chrony_active timesyncd_enabled timesyncd_active failed=0
+
+    detect_os
+    is_systemd || return 1
+    svc="$(chrony_service_name)"
+    chrony_package="$(manifest_value NTP_CHRONY_PACKAGE 2>/dev/null || true)"
+    timesyncd_package="$(manifest_value NTP_TIMESYNCD_PACKAGE 2>/dev/null || true)"
+    chrony_unit="$(manifest_value NTP_CHRONY_UNIT 2>/dev/null || true)"
+    timesyncd_unit="$(manifest_value NTP_TIMESYNCD_UNIT 2>/dev/null || true)"
+    chrony_enabled="$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)"
+    chrony_active="$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)"
+    timesyncd_enabled="$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)"
+    timesyncd_active="$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)"
+
+    systemctl stop "$svc" >/dev/null 2>&1 || true
+    if [ -n "$chrony_package" ]; then
+        restore_ntp_packages_to_state "$chrony_package" "$timesyncd_package" ||
+            failed=1
+    else
+        # 兼容 v1.0.21 及更早的 NTP 清单：旧记录没有原包状态。
+        # 为避免猜测后卸载用户原有软件，只恢复可确认的文件和现存 unit 状态。
+        warn "旧版 NTP 恢复记录缺少包状态，将保留当前已安装的软件包。"
+    fi
+    restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
+    restore_change_file NTP_SOURCES /etc/chrony/sources.d/vpsbox.sources || failed=1
+
+    if [ -n "$chrony_unit" ]; then
+        restore_ntp_unit_state "$svc" "$chrony_unit" "$chrony_enabled" "$chrony_active" ||
+            failed=1
+        restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
+            "$timesyncd_enabled" "$timesyncd_active" || failed=1
+    else
+        # 旧版只记录 active/enabled；unit 已不存在时无法安全重建，不能伪报恢复成功。
+        if systemd_unit_exists "${svc}.service"; then
+            restore_ntp_unit_state "$svc" present "$chrony_enabled" "$chrony_active" ||
+                failed=1
+        elif [ "$chrony_enabled" = "enabled" ] || [ "$chrony_active" = "active" ]; then
+            failed=1
+        fi
+        if systemd_unit_exists systemd-timesyncd.service; then
+            restore_ntp_unit_state systemd-timesyncd present \
+                "$timesyncd_enabled" "$timesyncd_active" || failed=1
+        elif [ "$timesyncd_enabled" = "enabled" ] || [ "$timesyncd_active" = "active" ]; then
+            failed=1
+        fi
+    fi
+    return "$failed"
 }
 
 show_chrony_permission_hint() {
@@ -3554,97 +4177,166 @@ show_chrony_permission_hint() {
 }
 
 enable_ntp_sync() {
-    local svc
-    local active_state
-    local enabled_state
-    local sources_output
-    local tracking_output
+    local svc active_state enabled_state sources_output tracking_output
     local conf source_file backup_dir
-    local chrony_was_active=0 chrony_was_enabled=0
-    local timesyncd_exists=0 timesyncd_was_active=0 timesyncd_was_enabled=0
+    local chrony_package="absent" timesyncd_package="absent"
+    local chrony_unit="absent" timesyncd_unit="absent"
+    local chrony_active="inactive" chrony_enabled="disabled"
+    local timesyncd_active="inactive" timesyncd_enabled="disabled"
+    local applied_before=0
 
     detect_os
     if ! is_systemd; then
-        err "未检测到 systemd，无法自动配置 chrony。"
+        if [ "$OS" = "alpine" ]; then
+            err "Alpine/OpenRC 当前不适用此功能；vpsbox 不会自动修改 chrony。"
+        else
+            err "未检测到 systemd，无法自动配置 chrony。"
+        fi
         return 1
     fi
 
     svc="$(chrony_service_name)"
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then chrony_was_active=1; fi
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then chrony_was_enabled=1; fi
-    if systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
-        timesyncd_exists=1
-        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then timesyncd_was_active=1; fi
-        if systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null; then timesyncd_was_enabled=1; fi
+    conf="$(chrony_conf_path)"
+    source_file="/etc/chrony/sources.d/vpsbox.sources"
+    ntp_package_installed chrony && chrony_package="installed"
+    if [ "$OS" = "debian" ] && ntp_package_installed systemd-timesyncd; then
+        timesyncd_package="installed"
+    fi
+    if systemd_unit_exists "${svc}.service"; then
+        chrony_unit="present"
+        systemctl is-active --quiet "$svc" 2>/dev/null && chrony_active="active"
+        systemctl is-enabled --quiet "$svc" 2>/dev/null && chrony_enabled="enabled"
+    fi
+    if systemd_unit_exists systemd-timesyncd.service; then
+        timesyncd_unit="present"
+        systemctl is-active --quiet systemd-timesyncd 2>/dev/null &&
+            timesyncd_active="active"
+        systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null &&
+            timesyncd_enabled="enabled"
+    fi
+
+    backup_change_file_once NTP_CONF "$conf" ||
+        { err "记录 chrony 原配置失败，已取消修改。"; return 1; }
+    backup_change_file_once NTP_SOURCES "$source_file" ||
+        { err "记录 NTP 源原配置失败，已取消修改。"; return 1; }
+    [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ] &&
+        applied_before=1
+    if [ "$applied_before" -eq 0 ]; then
+        manifest_set_once NTP_CHRONY_ACTIVE "$chrony_active" || return 1
+        manifest_set_once NTP_CHRONY_ENABLED "$chrony_enabled" || return 1
+        manifest_set_once NTP_CHRONY_PACKAGE "$chrony_package" || return 1
+        manifest_set_once NTP_CHRONY_UNIT "$chrony_unit" || return 1
+        manifest_set_once NTP_TIMESYNCD_ACTIVE "$timesyncd_active" || return 1
+        manifest_set_once NTP_TIMESYNCD_ENABLED "$timesyncd_enabled" || return 1
+        manifest_set_once NTP_TIMESYNCD_PACKAGE "$timesyncd_package" || return 1
+        manifest_set_once NTP_TIMESYNCD_UNIT "$timesyncd_unit" || return 1
+        mark_change_applied NTP_CONF || {
+            clear_ntp_change_tracking || true
+            err "无法记录 NTP 事务，已取消修改。"
+            return 1
+        }
+    else
+        # 兼容 v1.0.21 及更早已记录的 NTP 变更：旧清单没有包与 unit 字段，
+        # 不能用当前（修改后）状态反推原状态，因此这里绝不补写猜测值。
+        :
+    fi
+
+    backup_dir="$(mktemp -d /tmp/vpsbox-chrony.XXXXXX)" || return 1
+    if [ -f "$conf" ] && [ ! -L "$conf" ]; then
+        cp -a "$conf" "$backup_dir/conf" &&
+            : > "$backup_dir/conf.present" || {
+            cleanup_ntp_snapshot "$backup_dir" || true
+            return 1
+        }
+    elif [ ! -e "$conf" ] && [ ! -L "$conf" ]; then
+        : > "$backup_dir/conf.absent"
+    else
+        cleanup_ntp_snapshot "$backup_dir" || true
+        err "chrony 配置不是普通文件，已拒绝修改：$conf"
+        return 1
+    fi
+    if [ -f "$source_file" ] && [ ! -L "$source_file" ]; then
+        cp -a "$source_file" "$backup_dir/sources" &&
+            : > "$backup_dir/sources.present" || {
+            cleanup_ntp_snapshot "$backup_dir" || true
+            return 1
+        }
+    elif [ ! -e "$source_file" ] && [ ! -L "$source_file" ]; then
+        : > "$backup_dir/sources.absent"
+    else
+        cleanup_ntp_snapshot "$backup_dir" || true
+        err "NTP 源配置不是普通文件，已拒绝修改：$source_file"
+        return 1
     fi
 
     info "正在安装 chrony..."
     case "$OS" in
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update -y || return 1
-            if ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
-                show_chrony_permission_hint "$(chrony_service_name)"
+            if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
+                settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+                    "$chrony_package" "$timesyncd_package" \
+                    "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+                    "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+                    "$applied_before" || true
                 return 1
             fi
             ;;
         redhat)
             if command -v dnf >/dev/null 2>&1; then
-                if ! dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
-                    show_chrony_permission_hint "$(chrony_service_name)"
-                    return 1
-                fi
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
             else
-                if ! yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
-                    show_chrony_permission_hint "$(chrony_service_name)"
-                    return 1
-                fi
-            fi
-            ;;
-        alpine)
-            err "Alpine 暂不支持自动配置 chrony，请手动使用 apk/rc-service 配置。"
-            return 1
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
+            fi || {
+                settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+                    "$chrony_package" "$timesyncd_package" \
+                    "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+                    "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+                    "$applied_before" || true
+                return 1
+            }
             ;;
         *)
+            settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+                "$chrony_package" "$timesyncd_package" \
+                "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+                "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+                "$applied_before" || true
             err "未识别系统类型，无法自动配置 chrony。"
             return 1
             ;;
     esac
 
-    conf="$(chrony_conf_path)"
-    source_file="/etc/chrony/sources.d/vpsbox.sources"
-    backup_change_file_once NTP_CONF "$conf" || { err "记录 chrony 原配置失败，已取消修改。"; return 1; }
-    backup_change_file_once NTP_SOURCES "$source_file" || { err "记录 NTP 源原配置失败，已取消修改。"; return 1; }
-    backup_dir="$(mktemp -d /tmp/vpsbox-chrony.XXXXXX)" || return 1
-    cp -a "$conf" "$backup_dir/chrony.conf" || { rm -rf "$backup_dir"; err "备份 chrony 配置失败，已取消。"; return 1; }
-    if [ -e "$source_file" ] || [ -L "$source_file" ]; then
-        cp -a "$source_file" "$backup_dir/vpsbox.sources" || { rm -rf "$backup_dir"; err "备份 NTP 源配置失败，已取消。"; return 1; }
-        : > "$backup_dir/source-existed"
+    if [ ! -f "$conf" ] || [ -L "$conf" ]; then
+        err "chrony 安装后未生成有效配置，正在恢复原 NTP 状态。"
+        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+            "$chrony_package" "$timesyncd_package" \
+            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+            "$applied_before" || true
+        return 1
     fi
-    manifest_set_once NTP_CHRONY_ACTIVE "$([ "$chrony_was_active" -eq 1 ] && echo active || echo inactive)" || return 1
-    manifest_set_once NTP_CHRONY_ENABLED "$([ "$chrony_was_enabled" -eq 1 ] && echo enabled || echo disabled)" || return 1
-    manifest_set_once NTP_TIMESYNCD_ACTIVE "$([ "$timesyncd_was_active" -eq 1 ] && echo active || echo inactive)" || return 1
-    manifest_set_once NTP_TIMESYNCD_ENABLED "$([ "$timesyncd_was_enabled" -eq 1 ] && echo enabled || echo disabled)" || return 1
     info "chrony 服务名：$svc"
 
     systemctl stop "$svc" 2>/dev/null || true
     if ! write_chrony_sources; then
-        cp -a "$backup_dir/chrony.conf" "$conf"
-        if [ -f "$backup_dir/source-existed" ]; then cp -a "$backup_dir/vpsbox.sources" "$source_file"; else rm -f "$source_file"; fi
-        [ "$chrony_was_active" -eq 1 ] && systemctl start "$svc" 2>/dev/null || true
-        rm -rf "$backup_dir"
+        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+            "$chrony_package" "$timesyncd_package" \
+            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+            "$applied_before" || true
         return 1
     fi
 
     info "正在启用 chrony 并设置开机自启..."
     if ! systemctl enable --now "$svc"; then
         err "chrony 启动失败，正在恢复原 NTP 配置。"
-        systemctl stop "$svc" 2>/dev/null || true
-        cp -a "$backup_dir/chrony.conf" "$conf"
-        if [ -f "$backup_dir/source-existed" ]; then cp -a "$backup_dir/vpsbox.sources" "$source_file"; else rm -f "$source_file"; fi
-        if [ "$chrony_was_enabled" -eq 1 ]; then systemctl enable "$svc" 2>/dev/null || true; else systemctl disable "$svc" 2>/dev/null || true; fi
-        [ "$chrony_was_active" -eq 1 ] && systemctl start "$svc" 2>/dev/null || true
-        rm -rf "$backup_dir"
+        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+            "$chrony_package" "$timesyncd_package" \
+            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+            "$applied_before" || true
         show_chrony_permission_hint "$svc"
         return 1
     fi
@@ -3652,33 +4344,29 @@ enable_ntp_sync() {
     sleep 2
     if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
         err "chrony 未保持运行，正在恢复原 NTP 配置。"
-        systemctl stop "$svc" 2>/dev/null || true
-        cp -a "$backup_dir/chrony.conf" "$conf"
-        if [ -f "$backup_dir/source-existed" ]; then cp -a "$backup_dir/vpsbox.sources" "$source_file"; else rm -f "$source_file"; fi
-        if [ "$chrony_was_enabled" -eq 1 ]; then systemctl enable "$svc" 2>/dev/null || true; else systemctl disable "$svc" 2>/dev/null || true; fi
-        [ "$chrony_was_active" -eq 1 ] && systemctl start "$svc" 2>/dev/null || true
-        rm -rf "$backup_dir"
+        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+            "$chrony_package" "$timesyncd_package" \
+            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+            "$applied_before" || true
         show_chrony_permission_hint "$svc"
         return 1
     fi
 
-    if [ "$timesyncd_exists" -eq 1 ]; then
+    if systemd_unit_exists systemd-timesyncd.service; then
         info "chrony 已确认运行，正在停用 systemd-timesyncd，避免多个 NTP 客户端并存..."
         if ! systemctl disable --now systemd-timesyncd; then
             warn "无法停用 systemd-timesyncd；为避免多个 NTP 客户端并存，正在回滚 chrony 配置。"
-            systemctl stop "$svc" 2>/dev/null || true
-            cp -a "$backup_dir/chrony.conf" "$conf"
-            if [ -f "$backup_dir/source-existed" ]; then cp -a "$backup_dir/vpsbox.sources" "$source_file"; else rm -f "$source_file"; fi
-            if [ "$chrony_was_enabled" -eq 1 ]; then systemctl enable "$svc" 2>/dev/null || true; else systemctl disable "$svc" 2>/dev/null || true; fi
-            [ "$chrony_was_active" -eq 1 ] && systemctl start "$svc" 2>/dev/null || true
-            if [ "$timesyncd_was_enabled" -eq 1 ]; then systemctl enable systemd-timesyncd 2>/dev/null || true; fi
-            [ "$timesyncd_was_active" -eq 1 ] && systemctl start systemd-timesyncd 2>/dev/null || true
-            rm -rf "$backup_dir"
+            settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+                "$chrony_package" "$timesyncd_package" \
+                "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+                "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+                "$applied_before" || true
             return 1
         fi
     fi
-    rm -rf "$backup_dir"
-    mark_change_applied NTP_CONF || return 1
+    cleanup_ntp_snapshot "$backup_dir" ||
+        warn "NTP 配置已生效，但临时快照清理失败：$backup_dir"
 
     enabled_state="$(systemctl is-enabled "$svc" 2>/dev/null || echo "unknown")"
     active_state="$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")"
@@ -4242,15 +4930,26 @@ restore_ssh_config_backup() {
     local main_backup="$1"
     local dropin_path="$2"
     local dropin_backup="$3"
+    local failed=0
 
     if [ -n "$main_backup" ] && [ -e "$main_backup" ]; then
-        cp -a "$main_backup" "$SSHD_MAIN_CONF" || warn "恢复 $SSHD_MAIN_CONF 失败。"
+        cp -a "$main_backup" "$SSHD_MAIN_CONF" || {
+            warn "恢复 $SSHD_MAIN_CONF 失败。"
+            failed=1
+        }
     fi
     if [ -n "$dropin_backup" ] && [ -e "$dropin_backup" ]; then
-        cp -a "$dropin_backup" "$dropin_path" || warn "恢复 $dropin_path 失败。"
+        cp -a "$dropin_backup" "$dropin_path" || {
+            warn "恢复 $dropin_path 失败。"
+            failed=1
+        }
     else
-        rm -f "$dropin_path" || warn "删除 $dropin_path 失败。"
+        rm -f "$dropin_path" || {
+            warn "删除 $dropin_path 失败。"
+            failed=1
+        }
     fi
+    return "$failed"
 }
 
 set_main_ssh_port_directives() {
@@ -4560,8 +5259,61 @@ choose_ssh_target_port() {
     done
 }
 
+clear_ssh_change_tracking() {
+    local failed=0
+
+    clear_change_tracking SSHD_MAIN || failed=1
+    clear_change_tracking SSHD_PORT || failed=1
+    clear_change_tracking SSHD_HARDENING || failed=1
+    manifest_remove APPLIED_SSH_CONFIG || failed=1
+    manifest_remove SSH_PORTS || failed=1
+    return "$failed"
+}
+
+cleanup_unapplied_ssh_tracking() {
+    local applied_before="$1"
+
+    if [ "$applied_before" = "1" ]; then
+        ACTIVE_UNAPPLIED_SSH_TRACKING=0
+        return 0
+    fi
+    if clear_ssh_change_tracking; then
+        ACTIVE_UNAPPLIED_SSH_TRACKING=0
+        return 0
+    fi
+    ACTIVE_UNAPPLIED_SSH_TRACKING=1
+    return 1
+}
+
+ssh_unapplied_tracking_present() {
+    local key
+
+    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" != "1" ] || return 1
+    for key in BACKUP_SSHD_MAIN BACKUP_SSHD_PORT BACKUP_SSHD_HARDENING SSH_PORTS; do
+        manifest_value "$key" >/dev/null 2>&1 && return 0
+    done
+    [ -e "$CHANGE_BACKUP_DIR/SSHD_MAIN" ] || [ -L "$CHANGE_BACKUP_DIR/SSHD_MAIN" ] ||
+        [ -e "$CHANGE_BACKUP_DIR/SSHD_PORT" ] || [ -L "$CHANGE_BACKUP_DIR/SSHD_PORT" ] ||
+        [ -e "$CHANGE_BACKUP_DIR/SSHD_HARDENING" ] || [ -L "$CHANGE_BACKUP_DIR/SSHD_HARDENING" ]
+}
+
+settle_stale_unapplied_ssh_tracking() {
+    if [ "${ACTIVE_UNAPPLIED_SSH_TRACKING:-0}" != "1" ] &&
+        ! ssh_unapplied_tracking_present; then
+        return 0
+    fi
+    # v1.0.22 起 SSH 配置只会在 APPLIED_SSH_CONFIG 成功落盘后写入；
+    # 因此无 APPLIED 标记的残留仅是中断的首次基线，可安全清理后重新采集。
+    if cleanup_unapplied_ssh_tracking 0; then
+        return 0
+    fi
+    err "检测到未应用且无法清理的 SSH 恢复基线，已拒绝继续修改。"
+    return 1
+}
+
 rollback_ssh_port_change() {
-    local main_backup="$1" dropin_backup="$2" original_ports="$3" bin
+    local main_backup="$1" dropin_backup="$2" original_ports="$3"
+    local applied_before="${4:-1}" bin
 
     if ! restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"; then
         err "SSH 配置文件回滚失败，请通过控制台恢复。"
@@ -4592,7 +5344,30 @@ rollback_ssh_port_change() {
         err "SSH 已回滚，但主机防火墙未能恢复修改前的端口规则。"
         return 1
     fi
+    if [ "$applied_before" != "1" ]; then
+        # 首次 SSH 事务失败时必须同时清掉备份基线和端口记录；若此前已成功应用过，
+        # 则保留旧版本也会读取的 BACKUP_SSHD_* / SSH_PORTS，供恢复菜单继续回退。
+        if ! clear_ssh_change_tracking; then
+            err "SSH 已回滚，但无法清理首次事务记录；恢复菜单仍会保留该项目。"
+            return 1
+        fi
+    fi
     return 0
+}
+
+rollback_ssh_hardening_change() {
+    local main_backup="$1" dropin_backup="$2" applied_before="$3"
+    local restart_required="${4:-0}"
+
+    restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup" ||
+        return 1
+    if [ "$restart_required" = "1" ] && ! restart_ssh_service; then
+        return 1
+    fi
+    if [ "$applied_before" != "1" ]; then
+        # 与端口修改共用同一份旧版恢复基线，首次加固失败也不能留下过期备份。
+        clear_ssh_change_tracking || return 1
+    fi
 }
 
 warn_ssh_access_controls() {
@@ -4781,6 +5556,7 @@ apply_ssh_port_change() {
     local suffix
     local main_backup=""
     local dropin_backup=""
+    local ssh_change_was_applied=0
     local vpsbox_firewall_active=0
 
     if ! sshd_binary >/dev/null 2>&1; then
@@ -4798,6 +5574,7 @@ apply_ssh_port_change() {
         err "请先通过控制台处理 ssh.socket/sshd.socket，或关闭 socket activation 后重试。"
         return 1
     fi
+    settle_stale_unapplied_ssh_tracking || return 1
 
     new_port="$(choose_ssh_target_port)" || { info "已取消。"; return 0; }
     SSH_TARGET_PORT="$new_port"
@@ -4822,66 +5599,100 @@ apply_ssh_port_change() {
         return 0
     fi
 
-    backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" || return 1
-    backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || return 1
-    backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || return 1
-    original_ports="$(ssh_effective_ports_csv)" || { err "无法读取 SSH 当前生效端口，已取消修改。"; return 1; }
+    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] &&
+        ssh_change_was_applied=1
+    [ "$ssh_change_was_applied" = "1" ] || ACTIVE_UNAPPLIED_SSH_TRACKING=1
+    if ! backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" ||
+        ! backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" ||
+        ! backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        return 1
+    fi
+    original_ports="$(ssh_effective_ports_csv)" || {
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        err "无法读取 SSH 当前生效端口，已取消修改。"
+        return 1
+    }
     retired_ports="$(csv_remove_port "$original_ports" "$SSH_TARGET_PORT")" || {
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "无法计算 SSH 旧端口，已取消修改。"
         return 1
     }
-    manifest_set_once SSH_PORTS "$original_ports" || return 1
+    if ! manifest_set_once SSH_PORTS "$original_ports"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        return 1
+    fi
 
     suffix="$(date +%F-%H%M%S)"
     if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
         return 1
     fi
     if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_PORT_CONF" "$suffix")"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "备份 $SSHD_VPSBOX_PORT_CONF 失败，已取消修改。"
         return 1
     fi
     if ! ssh_firewall_transition_begin "$SSH_TARGET_PORT"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "主机防火墙无法临时放行 SSH 新端口，已取消修改。"
         return 1
     fi
+    # 在首次写入 SSH 配置前可靠落盘；若 Ctrl+C 发生在写入、校验或重启期间，
+    # 恢复菜单仍能识别并恢复原配置，不会留下“已修改但未记录”的状态。
+    if ! mark_change_applied SSH_CONFIG; then
+        ssh_firewall_transition_abort || true
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        err "无法记录 SSH 配置事务，已取消修改。"
+        return 1
+    fi
+    ACTIVE_UNAPPLIED_SSH_TRACKING=0
 
-    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_dropin_include_available; } || { ! ssh_main_has_active_port_directive && sshd_dropin_include_available; }; then
+    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_dropin_include_available; } || { ! sshd_main_has_active_port_directive && sshd_dropin_include_available; }; then
         write_action="vpsbox drop-in"
         write_vpsbox_ssh_port_config || {
             err "写入 SSH drop-in 失败，正在回滚。"
-            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
             return 1
         }
     else
         write_action="主配置"
         set_main_ssh_port_directives || {
             err "写入 SSH 主配置失败，正在回滚。"
-            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
             return 1
         }
     fi
 
     if ! validate_ssh_port_effective_config; then
         err "SSH 端口配置验证失败，正在回滚。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
         return 1
     fi
 
     if ! restart_ssh_service; then
         err "SSH 服务重启失败，正在回滚配置。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
         return 1
     fi
 
     if ! wait_for_ssh_listener "$SSH_TARGET_PORT"; then
         err "SSH 重启后未检测到 sshd 监听端口 $SSH_TARGET_PORT，正在回滚。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
         return 1
     fi
     if ! ssh_firewall_transition_finish; then
         err "主机防火墙无法同步 SSH 新端口，正在回滚配置。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
         return 1
     fi
 
@@ -4894,8 +5705,6 @@ apply_ssh_port_change() {
     else
         warn "Fail2ban sshd 端口同步失败，请稍后检查 fail2ban-client status sshd。"
     fi
-
-    mark_change_applied SSH_CONFIG || return 1
 
     info "SSH 端口已修改为 $SSH_TARGET_PORT。"
     [ -n "$main_backup" ] && info "主配置备份：$main_backup"
@@ -4926,6 +5735,8 @@ apply_ssh_basic_hardening() {
     local suffix
     local main_backup=""
     local dropin_backup=""
+    local original_ports
+    local ssh_change_was_applied=0
 
     if ! sshd_binary >/dev/null 2>&1; then
         err "未找到 sshd，无法修改 SSH 配置。"
@@ -4936,6 +5747,7 @@ apply_ssh_basic_hardening() {
         err "未找到 SSH 主配置：$SSHD_MAIN_CONF"
         return 1
     fi
+    settle_stale_unapplied_ssh_tracking || return 1
 
     if ssh_basic_hardening_effective; then
         info "SSH 基础加固已经生效，无需重复应用。"
@@ -4952,41 +5764,70 @@ apply_ssh_basic_hardening() {
         *) info "已取消，未修改 SSH 配置。"; return 0 ;;
     esac
 
-    backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" || return 1
-    backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || return 1
-    backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || return 1
-    manifest_set_once SSH_PORTS "$(ssh_effective_ports_csv)" || return 1
+    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] &&
+        ssh_change_was_applied=1
+    [ "$ssh_change_was_applied" = "1" ] || ACTIVE_UNAPPLIED_SSH_TRACKING=1
+    if ! backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" ||
+        ! backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" ||
+        ! backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        return 1
+    fi
+    original_ports="$(ssh_effective_ports_csv)" || {
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        err "无法读取 SSH 当前生效端口，已取消加固。"
+        return 1
+    }
+    if ! manifest_set_once SSH_PORTS "$original_ports"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        return 1
+    fi
 
     suffix="$(date +%F-%H%M%S)"
     if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
         return 1
     fi
     if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_HARDENING_CONF" "$suffix")"; then
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "备份 $SSHD_VPSBOX_HARDENING_CONF 失败，已取消修改。"
         return 1
     fi
+    # 与端口修改使用同一恢复标记，确保交互中断后仍可从恢复菜单回到原配置。
+    mark_change_applied SSH_CONFIG || {
+        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
+            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+        err "无法记录 SSH 配置事务，已取消修改。"
+        return 1
+    }
+    ACTIVE_UNAPPLIED_SSH_TRACKING=0
 
     if ! write_vpsbox_ssh_hardening_config || ! ensure_sshd_dropin_include; then
         err "写入 SSH 基础加固配置失败，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup"
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 ||
+            warn "SSH 配置未能完整回滚，恢复标记已保留。"
         return 1
     fi
 
     if ! validate_ssh_hardening_effective_config; then
         err "SSH 基础加固配置验证失败，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup"
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 ||
+            warn "SSH 配置未能完整回滚，恢复标记已保留。"
         return 1
     fi
 
     if ! restart_ssh_service; then
         err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup"
-        restart_ssh_service >/dev/null 2>&1 || true
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 1 ||
+            warn "SSH 配置或服务未能完整回滚，恢复标记已保留。"
         return 1
     fi
-
-    mark_change_applied SSH_CONFIG || return 1
 
     info "SSH 基础加固已应用。"
     [ -n "$main_backup" ] && info "主配置备份：$main_backup"
@@ -5111,7 +5952,7 @@ settle_failed_ssh_restore() {
 }
 
 restore_vpsbox_ssh_config() {
-    local confirm tmp original_ports current_ports name path cleanup_failed=0
+    local confirm tmp original_ports current_ports name path
 
     [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] || {
         warn "没有已记录的 vpsbox SSH 配置可恢复。"
@@ -5170,12 +6011,7 @@ restore_vpsbox_ssh_config() {
         return 1
     fi
     rm -rf "$tmp"
-    clear_change_tracking SSHD_MAIN || cleanup_failed=1
-    clear_change_tracking SSHD_PORT || cleanup_failed=1
-    clear_change_tracking SSHD_HARDENING || cleanup_failed=1
-    manifest_remove APPLIED_SSH_CONFIG || cleanup_failed=1
-    manifest_remove SSH_PORTS || cleanup_failed=1
-    if [ "$cleanup_failed" -ne 0 ]; then
+    if ! clear_ssh_change_tracking; then
         err "SSH 配置已恢复，但变更清单清理失败；已保留剩余记录供人工核验。"
         return 1
     fi
@@ -5263,31 +6099,66 @@ EOF
 }
 
 update_system_packages() {
-    detect_os
-    if [ "$OS" != "debian" ]; then
-        err "系统更新当前仅支持 Debian/Ubuntu。"
-        case "$OS" in
-            alpine) warn "Alpine 可手动执行：apk update && apk upgrade" ;;
-            redhat) warn "RedHat 系可手动执行：dnf upgrade -y 或 yum update -y" ;;
-            *) warn "未识别系统类型，已取消。" ;;
-        esac
-        return 1
-    fi
+    local confirm
 
-    cat <<EOF
+    detect_os
+    case "$OS" in
+        debian)
+            cat <<EOF
 即将执行系统更新：
 apt update && apt upgrade -y && apt autoremove -y
 EOF
-    read -r -p "确认继续？[y/N]: " confirm
+            ;;
+        alpine)
+            cat <<EOF
+即将执行系统更新：
+apk update && apk upgrade
+EOF
+            ;;
+        redhat)
+            err "系统更新当前不自动支持 RedHat 系。"
+            warn "可手动执行：dnf upgrade -y 或 yum update -y"
+            return 1
+            ;;
+        *)
+            err "未识别系统类型，已取消系统更新。"
+            return 1
+            ;;
+    esac
+
+    read -r -p "确认继续？[y/N]: " confirm || return 1
     case "$confirm" in
         y|Y|yes|YES) ;;
         *) info "已取消系统更新。"; return 0 ;;
     esac
 
-    export DEBIAN_FRONTEND=noninteractive
-    retry 3 2 apt update
-    retry 3 2 apt upgrade -y
-    retry 3 2 apt autoremove -y
+    case "$OS" in
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update || {
+                err "APT 软件包索引更新失败，已停止后续步骤。"
+                return 1
+            }
+            apt_get_bounded "$SYSTEM_UPGRADE_TIMEOUT" upgrade -y || {
+                err "APT 软件包升级失败，已停止后续步骤。"
+                return 1
+            }
+            apt_get_bounded "$SYSTEM_UPGRADE_TIMEOUT" autoremove -y || {
+                err "APT 自动清理失败。"
+                return 1
+            }
+            ;;
+        alpine)
+            apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update || {
+                err "APK 软件包索引更新失败，已停止后续步骤。"
+                return 1
+            }
+            apk_bounded "$SYSTEM_UPGRADE_TIMEOUT" upgrade || {
+                err "APK 软件包升级失败。"
+                return 1
+            }
+            ;;
+    esac
 
     if [ "$(reboot_required_state)" = "需要" ]; then
         warn "系统更新完成，检测到需要重启 VPS。"
@@ -5421,14 +6292,16 @@ install_fail2ban() {
 
 normalize_port_csv() {
     local input="${1:-}" item
-    local -a items
+    local -a items normalized_items=()
 
     [ -n "$input" ] || return 0
     IFS=',' read -ra items <<< "$input"
     for item in "${items[@]}"; do
-        is_valid_port "$item" || return 1
+        item="$(normalize_port_decimal "$item")" || return 1
+        normalized_items+=("$item")
     done
-    printf '%s\n' "${items[@]}" | sort -n -u | paste -sd, -
+    # 旧状态文件可能保存过带前导零的端口；读取时统一迁移成 nftables 使用的十进制形式。
+    printf '%s\n' "${normalized_items[@]}" | sort -n -u | paste -sd, -
 }
 
 csv_contains_port() {
@@ -5668,16 +6541,38 @@ firewall_native_service_enabled() {
     fi
 }
 
+firewall_openrc_service_enabled() {
+    local service="$1" runlevels_dir="${2:-/etc/runlevels}" entry
+
+    [ -n "$service" ] && [ -d "$runlevels_dir" ] || return 1
+    for entry in "$runlevels_dir"/*/"$service"; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        return 0
+    done
+    return 1
+}
+
+firewall_firewalld_enabled_or_active() {
+    if is_systemd; then
+        systemctl is-active --quiet firewalld 2>/dev/null ||
+            systemctl is-enabled --quiet firewalld 2>/dev/null
+    elif [ "$OS" = "alpine" ]; then
+        { command -v rc-service >/dev/null 2>&1 &&
+            rc-service firewalld status >/dev/null 2>&1; } ||
+            firewall_openrc_service_enabled firewalld
+    else
+        return 1
+    fi
+}
+
 firewall_check_conflicts() {
     if command -v ufw >/dev/null 2>&1 &&
         ufw status 2>/dev/null | grep -Eqi '^Status:[[:space:]]*active'; then
         err "检测到 UFW 正在运行。为避免规则链冲突，请先停用 UFW 后再启用主机防火墙。"
         return 1
     fi
-    if { is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; } ||
-        { [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1 &&
-            rc-service firewalld status >/dev/null 2>&1; }; then
-        err "检测到 firewalld 正在运行。为避免规则链冲突，请先停用 firewalld。"
+    if firewall_firewalld_enabled_or_active; then
+        err "检测到 firewalld 已启用或正在运行。为避免重启后出现规则链冲突，请先停用 firewalld。"
         return 1
     fi
     if firewall_native_service_enabled; then
@@ -6779,7 +7674,8 @@ firewall_sleep_process_matches() {
         sleep|*/sleep) ;;
         *) return 1 ;;
     esac
-    # 兼容 v1.0.16-v1.0.18 的一次性 sleep 90；当前 watchdog 使用 sleep 1 轮询。
+    # 兼容 v1.0.16-v1.0.18 的一次性 sleep 90：脚本升级后仍需能终止旧快照留下的等待进程。
+    # 当前 watchdog 使用 sleep 1 轮询；这里只接受两种精确参数，避免误杀其他 sleep。
     [ "${args[1]}" = "1" ] || [ "${args[1]}" = "$FIREWALL_ROLLBACK_SECONDS" ]
 }
 
@@ -6893,7 +7789,8 @@ firewall_stop_rollback_watchdog() {
     if [ -e "$dir/watchdog.pid" ]; then
         IFS= read -r pid < "$dir/watchdog.pid" || pid=""
         if is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ]; then
-            # 兼容 v1.0.16-v1.0.18 仅写 watchdog.pid 的快照；同一分支也处理当前版本分步写元数据时的中断状态。
+            # 兼容 v1.0.16-v1.0.18 仅写 watchdog.pid 的快照：升级后旧快照仍可能待回滚。
+            # 缺少身份字段时必须再核对精确脚本命令行，避免 PID 复用导致误杀；该分支也处理当前版本分步落盘中断。
             if [ -e "$dir/watchdog.start" ] && [ -e "$dir/watchdog.boot" ]; then
                 if firewall_watchdog_identity_matches "$dir" "$pid"; then
                     start="$(process_start_ticks "$pid")"
@@ -6915,7 +7812,8 @@ firewall_stop_rollback_watchdog() {
         fi
     fi
 
-    # PID 文件仅作为快速定位提示；最终扫描精确命令行，可收敛空文件、陈旧 PID 和落盘前中断。
+    # 兼容旧快照的空 PID、陈旧 PID，以及当前版本在元数据落盘前中断的情况。
+    # PID 文件仅作快速定位，最终只扫描精确 rollback.sh 命令行，既能收敛遗留 watchdog 又避免误杀。
     while IFS= read -r found_pid; do
         [ -n "$found_pid" ] || continue
         start="$(process_start_ticks "$found_pid" 2>/dev/null || true)"
@@ -7178,7 +8076,8 @@ firewall_start_rollback_watchdog() {
     [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
         [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
     : > "$dir/armed"
-    nohup sh "$dir/rollback.sh" >> "$dir/rollback.log" 2>&1 &
+    # watchdog 必须独立于菜单存活以执行超时回滚，但不能继承菜单的 flock FD 200。
+    nohup sh "$dir/rollback.sh" >> "$dir/rollback.log" 2>&1 200>&- &
     pid=$!
     start="$(process_start_ticks "$pid" || true)"
     boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
@@ -8163,9 +9062,11 @@ public_ipv4() {
 
 resolve_host_ips() {
     local host="$1"
+    local output
 
     command -v getent >/dev/null 2>&1 || return 1
-    getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | head -n 5
+    output="$(run_bounded_command 12 getent ahosts "$host" 2>/dev/null)" || return 1
+    printf '%s\n' "$output" | awk '{print $1}' | sort -u | head -n 5
 }
 
 run_self_check() {
@@ -8938,15 +9839,17 @@ uninstall_singbox_and_nodes() {
 
     if [ "$OS" = "alpine" ]; then
         rm -f /etc/init.d/sing-box /etc/runlevels/default/sing-box || failed=1
-        if singbox_package_installed && ! apk del sing-box; then failed=1; fi
+        if singbox_package_installed &&
+            ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" del sing-box; then failed=1; fi
     elif [ "$OS" = "debian" ]; then
-        if singbox_package_installed && ! apt-get purge -y sing-box; then failed=1; fi
+        if singbox_package_installed &&
+            ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" purge -y sing-box; then failed=1; fi
     elif [ "$OS" = "redhat" ]; then
         if singbox_package_installed; then
             if command -v dnf >/dev/null 2>&1; then
-                dnf remove -y sing-box || failed=1
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y sing-box || failed=1
             else
-                yum remove -y sing-box || failed=1
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y sing-box || failed=1
             fi
         fi
     fi
@@ -9169,6 +10072,45 @@ cleanup_old_temp_files() {
     find "$path" -xdev -maxdepth 1 -type f -user root -name 'vpsbox-*' -mtime +7 -print -delete 2>/dev/null || true
 }
 
+cleanup_old_temp_dirs() {
+    local base="$1" path
+
+    case "$base" in
+        /tmp|/var/tmp) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$base" ] && [ ! -L "$base" ] || return 0
+    while IFS= read -r -d '' path; do
+        [ -d "$path" ] && [ ! -L "$path" ] || continue
+        case "$path" in
+            "${ACTIVE_NODE_BACKUP:-}"|"${ACTIVE_TRACE_TMP:-}") continue ;;
+        esac
+        case "$path" in
+            "$base"/vpsbox-node-backup.*|\
+            "$base"/vpsbox-sing-box-release.*|\
+            "$base"/vpsbox-sing-box-update.*|\
+            "$base"/vpsbox-chrony.*|\
+            "$base"/vpsbox-ssh-restore.*|\
+            "$base"/vpsbox-bbr.*|\
+            "$base"/vpsbox-trace.*|\
+            "$base"/vpsbox-journald.*)
+                rm -rf -- "$path" || warn "清理遗留临时目录失败：$path"
+                ;;
+        esac
+    done < <(
+        find "$base" -xdev -mindepth 1 -maxdepth 1 -type d -user root -mtime +7 \
+            \( -name 'vpsbox-node-backup.*' \
+            -o -name 'vpsbox-sing-box-release.*' \
+            -o -name 'vpsbox-sing-box-update.*' \
+            -o -name 'vpsbox-chrony.*' \
+            -o -name 'vpsbox-ssh-restore.*' \
+            -o -name 'vpsbox-bbr.*' \
+            -o -name 'vpsbox-trace.*' \
+            -o -name 'vpsbox-journald.*' \) \
+            -print0 2>/dev/null
+    )
+}
+
 cleanup_orphaned_change_backups() {
     local backup name state old_file
     [ -d "$CHANGE_BACKUP_DIR" ] || return 0
@@ -9203,6 +10145,8 @@ cleanup_system_garbage() {
     if command -v apk >/dev/null 2>&1; then apk cache clean || warn "APK 缓存清理失败。"; fi
     cleanup_old_temp_files /tmp
     cleanup_old_temp_files /var/tmp
+    cleanup_old_temp_dirs /tmp
+    cleanup_old_temp_dirs /var/tmp
     cleanup_orphaned_change_backups || warn "vpsbox 未引用备份清理不完整。"
     if command -v journalctl >/dev/null 2>&1; then
         read -r -p "是否清理超过 30 天的 systemd 日志？请输入 YES，其他输入跳过：" journal_confirm
@@ -9230,7 +10174,7 @@ show_vpsbox_changes() {
 }
 
 restore_vpsbox_system_changes() {
-    local confirm cc fq chrony timesyncd old failed=0
+    local confirm cc fq old failed=0
     local fail2ban_active fail2ban_enabled
 
     show_vpsbox_changes
@@ -9261,6 +10205,8 @@ restore_vpsbox_system_changes() {
             fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || failed=1
             fail2ban_active="$(manifest_value FAIL2BAN_ACTIVE 2>/dev/null || true)"
             fail2ban_enabled="$(manifest_value FAIL2BAN_ENABLED 2>/dev/null || true)"
+            # 兼容 v1.0.0-v1.0.1 已记录 Fail2ban 配置但尚未记录服务状态的清单：
+            # 缺失状态时不猜测启用关系，仅在服务当前仍运行时重启以加载恢复后的配置。
             if is_systemd; then
                 if [ "$fail2ban_enabled" = "enabled" ]; then systemctl enable fail2ban || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then systemctl disable fail2ban || failed=1; fi
                 if [ "$fail2ban_active" = "active" ]; then systemctl restart fail2ban || failed=1; elif [ "$fail2ban_active" = "inactive" ]; then systemctl stop fail2ban || failed=1; elif systemctl is-active --quiet fail2ban; then systemctl restart fail2ban || failed=1; fi
@@ -9275,17 +10221,7 @@ restore_vpsbox_system_changes() {
         is_systemd && systemctl restart systemd-journald && systemctl is-active --quiet systemd-journald || failed=1
     fi
     if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
-        if is_systemd; then
-            chrony="$(chrony_service_name)"
-            systemctl stop "$chrony" || failed=1
-            restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
-            restore_change_file NTP_SOURCES /etc/chrony/sources.d/vpsbox.sources || failed=1
-            if [ "$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)" = "enabled" ]; then systemctl enable "$chrony" || failed=1; else systemctl disable "$chrony" || failed=1; fi
-            if [ "$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start "$chrony" || failed=1; else systemctl stop "$chrony" || failed=1; fi
-            timesyncd="$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)"
-            if [ "$timesyncd" = "enabled" ]; then systemctl enable systemd-timesyncd || failed=1; else systemctl disable systemd-timesyncd || failed=1; fi
-            if [ "$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start systemd-timesyncd || failed=1; else systemctl stop systemd-timesyncd || failed=1; fi
-        else
+        if ! restore_recorded_ntp_change; then
             err "当前环境无法恢复 systemd 管理的 NTP 状态。"
             failed=1
         fi
@@ -9306,12 +10242,7 @@ restore_vpsbox_system_changes() {
         manifest_remove BBR_FQ || failed=1
     fi
     if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
-        clear_change_tracking NTP_CONF || failed=1
-        clear_change_tracking NTP_SOURCES || failed=1
-        manifest_remove NTP_CHRONY_ACTIVE || failed=1
-        manifest_remove NTP_CHRONY_ENABLED || failed=1
-        manifest_remove NTP_TIMESYNCD_ACTIVE || failed=1
-        manifest_remove NTP_TIMESYNCD_ENABLED || failed=1
+        clear_ntp_change_tracking || failed=1
     fi
     for name in DNS_RESOLV DNS_RESOLVED GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF; do
         if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
@@ -9617,9 +10548,16 @@ EOF
 }
 
 system_menu() {
-    local opt
+    local opt ntp_label journal_label
 
     while true; do
+        detect_os
+        ntp_label="开启 NTP 时间同步"
+        journal_label="限制 systemd 日志大小"
+        if [ "$OS" = "alpine" ]; then
+            ntp_label+="（Alpine/OpenRC 不适用）"
+            journal_label+="（Alpine/OpenRC 不适用）"
+        fi
         clear 2>/dev/null || true
         cat <<EOF
 ========================================
@@ -9638,7 +10576,7 @@ system_menu() {
  [1] 系统更新
  [2] 垃圾清理
  [3] 修改主机名
- [4] 开启 NTP 时间同步
+ [4] $ntp_label
  [5] 修改系统 IPv4 DNS
  [6] 启用系统 IPv4 优先
  [7] 一键开启 BBR + fq
@@ -9646,7 +10584,7 @@ system_menu() {
  [9] SSH 基础加固
  [10] 查看 SSH 当前生效配置
  [11] 安装 Fail2ban
- [12] 限制 systemd 日志大小
+ [12] $journal_label
  [13] 查看/恢复 vpsbox 系统改动
  [0] 返回主菜单
 ========================================
@@ -9815,6 +10753,9 @@ EOF
 main_loop() {
     while true; do
         show_menu
+        # 只有新版已完成初始化并成功渲染首个菜单，才确认本次自更新启动成功。
+        # v1.0.21 及更早版本不会传递握手变量，因此普通启动不会误用陈旧 .previous。
+        confirm_pending_vpsbox_update
         read -r -p "请输入选项: " opt || exit 0
         echo ""
 
@@ -9835,12 +10776,18 @@ main_loop() {
 }
 
 vpsbox_main() {
+    if [ -n "${PENDING_VPSBOX_UPDATE_BACKUP:-}${PENDING_VPSBOX_UPDATE_READY_FILE:-}" ]; then
+        # 更新后的新进程可能在取得菜单锁前失败，必须提前安装 EXIT 回滚处理。
+        trap cleanup_vpsbox_runtime EXIT
+    fi
     need_root
     detect_os
     acquire_lock
     install_self_command
-    check_vpsbox_update_on_start
-    auto_update_vpsbox_on_start
+    if [ -z "${PENDING_VPSBOX_UPDATE_BACKUP:-}${PENDING_VPSBOX_UPDATE_READY_FILE:-}" ]; then
+        check_vpsbox_update_on_start
+        auto_update_vpsbox_on_start
+    fi
     main_loop
 }
 
