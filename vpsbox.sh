@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.30"
+VPSBOX_VERSION="v1.0.31"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -11785,7 +11785,7 @@ $(ipv4_dns_lines)
  [6] 三网回程测试
  [7] 第三方脚本
 ----------------------------------------
- [00] 更新 vpsbox 脚本
+ [00] 更新 vpsbox
  [88] 卸载 vpsbox
  [0] 退出
 ========================================

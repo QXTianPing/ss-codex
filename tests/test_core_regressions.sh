@@ -302,7 +302,8 @@ test_main_and_system_menu_presentation() {
         assert_file_contains "$main_output" '^ \[5\] 一键检测$'
         assert_file_contains "$main_output" '^ \[6\] 三网回程测试$'
         assert_file_contains "$main_output" '^ \[7\] 第三方脚本$'
-        assert_file_not_contains "$main_output" '一键自检|查看三网回程|其他脚本'
+        assert_file_contains "$main_output" '^ \[00\] 更新 vpsbox$'
+        assert_file_not_contains "$main_output" '一键自检|查看三网回程|其他脚本|更新 vpsbox 脚本'
 
         detect_os() {
             # OS is consumed dynamically by system_menu.
