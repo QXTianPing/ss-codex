@@ -157,19 +157,28 @@ test_allowed_ports_merge_known_public_docker_and_extra_sources() {
         ssh_effective_ports_csv() { printf '%s\n' 23333; }
         ssh_listening_ports_csv() { printf '%s\n' 23333; }
         require_valid_node_state_if_present() { :; }
-        node_exists() { return 0; }
-        load_state() { PORT=31423; PROTOCOL=shadowsocks; : "$PORT" "$PROTOCOL"; }
+        protocol_visible_exists() { return 0; }
+        load_protocol_state() {
+            if [ "$1" = vless ]; then
+                PORT=43333
+                PROTOCOL=vless-reality
+            else
+                PORT=31423
+                PROTOCOL=shadowsocks
+            fi
+            : "$PORT" "$PROTOCOL"
+        }
         firewall_detect_docker_ports() {
             FW_DOCKER_PUBLIC_TCP='8080'
             FW_DOCKER_PUBLIC_UDP=''
         }
         firewall_detect_public_listeners() {
-            FW_PUBLIC_TCP='80,443,8080,8443,23333,31423'
+            FW_PUBLIC_TCP='80,443,8080,8443,23333,31423,43333'
             FW_PUBLIC_UDP='443,5353,31423'
         }
 
         firewall_detect_allowed_ports
-        assert_eq '80,443,8080,8443,23333,31423' "$FW_ALLOWED_TCP" "TCP 应合并所有放行来源"
+        assert_eq '80,443,8080,8443,23333,31423,43333' "$FW_ALLOWED_TCP" "TCP 应合并两种节点及其他放行来源"
         assert_eq '443,5353,31423' "$FW_ALLOWED_UDP" "UDP 应合并所有放行来源"
         assert_eq '80,443' "$FW_OTHER_PUBLIC_TCP" "其他公网 TCP 应扣除已分类来源"
         assert_eq '443' "$FW_OTHER_PUBLIC_UDP" "其他公网 UDP 应扣除节点与额外端口"
@@ -184,7 +193,7 @@ test_stopped_public_service_is_removed_unless_extra() {
         ssh_effective_ports_csv() { printf '%s\n' 23333; }
         ssh_listening_ports_csv() { printf '%s\n' 23333; }
         require_valid_node_state_if_present() { :; }
-        node_exists() { return 1; }
+        protocol_visible_exists() { return 1; }
         firewall_detect_docker_ports() {
             FW_DOCKER_PUBLIC_TCP=''
             FW_DOCKER_PUBLIC_UDP=''

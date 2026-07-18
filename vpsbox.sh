@@ -12,14 +12,23 @@ NEXTTRACE_RELEASE_VERSION="1.7.1"
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
 CMD_PATH="/usr/local/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
-CONFIG_PATH="$CONFIG_DIR/config.json"
-STATE_FILE="$CONFIG_DIR/vpsbox.env"
+# sing-box 软件包可能生成默认 config.json；vpsbox 节点只使用 vpsbox.d 独立配置。
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
+NODE_CONFIG_DIR="$CONFIG_DIR/vpsbox.d"
+SS_CONFIG_PATH="$NODE_CONFIG_DIR/10-ss.json"
+VLESS_CONFIG_PATH="$NODE_CONFIG_DIR/20-vless-reality.json"
+SS_STATE_FILE="$CONFIG_DIR/vpsbox-ss.env"
+VLESS_STATE_FILE="$CONFIG_DIR/vpsbox-vless.env"
+SS_URI_FILE="$CONFIG_DIR/vpsbox-ss-uri.txt"
+VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
 JOURNALD_VPSBOX_CONF="/etc/systemd/journald.conf.d/99-vpsbox.conf"
 VPSBOX_STATE_DIR="/etc/vpsbox"
 CHANGE_MANIFEST="$VPSBOX_STATE_DIR/changes.env"
 CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
+NODE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/node-transaction"
+NODE_TRANSACTION_BACKUP="$NODE_TRANSACTION_DIR/backup"
+NODE_TRANSACTION_STAGE="$NODE_TRANSACTION_DIR/stage"
 GAI_CONF="/etc/gai.conf"
 NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
 NTP_SOURCES_END="# END VPSBOX NTP SOURCES"
@@ -75,7 +84,8 @@ ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
 ACTIVE_SINGBOX_UPDATE_MUTATED=0
 ACTIVE_SINGBOX_UPDATE_ROLLING_BACK=0
 SERVICE_NAME="sing-box"
-METHOD="2022-blake3-aes-128-gcm"
+SS_METHOD="2022-blake3-aes-128-gcm"
+METHOD="$SS_METHOD"
 PORT_MIN=10000
 PORT_MAX=60000
 TRACE_NAMES=(
@@ -587,12 +597,14 @@ cleanup_vpsbox_runtime() {
         rollback_active_singbox_update ||
             warn "sing-box 更新被中断，旧版本或原服务状态未能完整恢复；更新备份已保留。"
     fi
-    if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ]; then
+    if [ "$backup" = "$NODE_TRANSACTION_DIR" ] && [ -d "$backup" ]; then
         if declare -F rollback_active_node_transaction >/dev/null 2>&1; then
-            rollback_active_node_transaction || true
+            rollback_active_node_transaction ||
+                warn "节点操作被中断，自动恢复未完成；事务备份已保留：$NODE_TRANSACTION_DIR"
         elif declare -F restore_node_files >/dev/null 2>&1; then
             ACTIVE_NODE_BACKUP=""
-            restore_node_files "$backup" || true
+            restore_node_files "$NODE_TRANSACTION_BACKUP" ||
+                warn "节点操作被中断，自动恢复未完成；事务备份已保留：$NODE_TRANSACTION_DIR"
         fi
     fi
     if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] &&
@@ -1246,7 +1258,7 @@ install_self_command() {
 secure_config_dir() {
     local path
 
-    if [ -L "$CONFIG_DIR" ]; then
+    if [ -L "$CONFIG_DIR" ] || [ -L "$NODE_CONFIG_DIR" ]; then
         err "$CONFIG_DIR 是符号链接，已拒绝使用。"
         return 1
     fi
@@ -1254,13 +1266,25 @@ secure_config_dir() {
     mkdir -p "$CONFIG_DIR" || return 1
     chown root:root "$CONFIG_DIR" || return 1
     chmod 700 "$CONFIG_DIR" || return 1
+    if [ -d "$NODE_CONFIG_DIR" ]; then
+        chown root:root "$NODE_CONFIG_DIR" || return 1
+        chmod 700 "$NODE_CONFIG_DIR" || return 1
+    fi
 
-    for path in "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" "${CONFIG_PATH}.bak"; do
+    for path in "$URI_FILE" "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH" \
+        "$SS_STATE_FILE" "$VLESS_STATE_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
         if [ -L "$path" ]; then
             err "$path 是符号链接，已拒绝使用。"
             return 1
         fi
     done
+}
+
+secure_node_config_dir() {
+    secure_config_dir || return 1
+    mkdir -p "$NODE_CONFIG_DIR" || return 1
+    chown root:root "$NODE_CONFIG_DIR" || return 1
+    chmod 700 "$NODE_CONFIG_DIR"
 }
 
 ensure_change_store() {
@@ -1603,7 +1627,8 @@ singbox_config_pids() {
         [ "${exe##*/}" = "sing-box" ] || continue
         mapfile -d '' -t args < "$proc/cmdline" 2>/dev/null || true
         [ "${#args[@]}" -ge 4 ] || continue
-        if [ "${args[1]}" = "run" ] && [ "${args[2]}" = "-c" ] && [ "${args[3]}" = "$CONFIG_PATH" ]; then
+        if [ "${args[1]}" = "run" ] &&
+            [ "${args[2]}" = "-C" ] && [ "${args[3]}" = "$NODE_CONFIG_DIR" ]; then
             printf '%s\n' "$pid"
         fi
     done
@@ -1615,7 +1640,7 @@ stop_singbox_config_processes() {
     refuse_service_mutation_in_test stop_singbox_config_processes || return 1
     pids="$(singbox_config_pids)"
     [ -n "$pids" ] || return 0
-    warn "检测到使用 $CONFIG_PATH 的残留 sing-box 进程，正在停止：$(echo "$pids" | tr '\n' ' ')"
+    warn "检测到使用 vpsbox 节点配置的残留 sing-box 进程，正在停止：$(echo "$pids" | tr '\n' ' ')"
     while read -r pid; do
         [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
     done <<< "$pids"
@@ -1879,36 +1904,63 @@ EOF
     rm -f "$public_file" "$local_file" "$suggest_file"
 }
 
-node_exists() {
-    [ -f "$CONFIG_PATH" ] && [ ! -L "$CONFIG_PATH" ] && load_state >/dev/null 2>&1
+node_config_path() {
+    case "$1" in
+        ss) printf '%s\n' "$SS_CONFIG_PATH" ;;
+        vless) printf '%s\n' "$VLESS_CONFIG_PATH" ;;
+        *) return 2 ;;
+    esac
 }
 
-node_artifacts_present() {
-    [ -e "$CONFIG_PATH" ] || [ -e "$STATE_FILE" ] || [ -e "$URI_FILE" ]
+node_state_path() {
+    case "$1" in
+        ss) printf '%s\n' "$SS_STATE_FILE" ;;
+        vless) printf '%s\n' "$VLESS_STATE_FILE" ;;
+        *) return 2 ;;
+    esac
 }
 
-require_valid_node_state_if_present() {
-    if node_artifacts_present && ! node_exists; then
-        err "检测到残缺或不安全的节点配置，已拒绝继续以免覆盖配置或遗漏端口。"
-        err "请先检查 $CONFIG_PATH 与 $STATE_FILE。"
-        return 1
-    fi
+node_uri_path() {
+    case "$1" in
+        ss) printf '%s\n' "$SS_URI_FILE" ;;
+        vless) printf '%s\n' "$VLESS_URI_FILE" ;;
+        *) return 2 ;;
+    esac
 }
 
-state_file_is_secure() {
-    local owner
-    local mode
-
-    [ -f "$STATE_FILE" ] || return 1
-    [ ! -L "$STATE_FILE" ] || return 1
-    owner="$(stat -c '%u' "$STATE_FILE" 2>/dev/null)" || return 1
-    mode="$(stat -c '%a' "$STATE_FILE" 2>/dev/null)" || return 1
-    [ "$owner" = "0" ] || return 1
-    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-    (( (8#$mode & 8#077) == 0 ))
+node_protocol_display_name() {
+    case "$1" in
+        ss) printf '%s\n' "Shadowsocks" ;;
+        vless) printf '%s\n' "VLESS Reality" ;;
+        *) return 2 ;;
+    esac
 }
 
-load_state() {
+node_file_is_secure() {
+    local file="$1"
+    local owner group mode
+
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    owner="$(stat -c '%u' "$file" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$file" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] && [ "$mode" = "600" ]
+}
+
+node_dir_is_secure() {
+    local dir="$1"
+    local owner group mode
+
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    owner="$(stat -c '%u' "$dir" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$dir" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$dir" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] && [ "$mode" = "700" ]
+}
+
+load_state_file() {
+    local file="$1"
+    local expected_protocol="$2"
     local key
     local value
     local domain=""
@@ -1916,22 +1968,22 @@ load_state() {
     local port=""
     local password=""
     local method=""
-    # 兼容早期尚未写入 PROTOCOL 字段的 SS 状态文件；缺省协议只能按 Shadowsocks 处理。
-    local protocol="shadowsocks"
+    local protocol=""
     local uuid=""
     local flow=""
     local reality_server_name=""
+    local reality_private_key=""
     local reality_public_key=""
     local reality_short_id=""
     local fingerprint=""
+    local config_id=""
     local seen_keys=""
 
-    state_file_is_secure || return 1
-
+    node_file_is_secure "$file" || return 1
     while IFS='=' read -r key value; do
         case "$key" in
             ""|'#'*) continue ;;
-            DOMAIN|NAME|PORT|PASSWORD|METHOD|PROTOCOL|UUID|FLOW|REALITY_SERVER_NAME|REALITY_PUBLIC_KEY|REALITY_SHORT_ID|FINGERPRINT)
+            DOMAIN|NAME|PORT|PASSWORD|METHOD|PROTOCOL|UUID|FLOW|REALITY_SERVER_NAME|REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|REALITY_SHORT_ID|FINGERPRINT|CONFIG_ID)
                 case " $seen_keys " in
                     *" $key "*) return 1 ;;
                 esac
@@ -1949,24 +2001,29 @@ load_state() {
             UUID) uuid="$value" ;;
             FLOW) flow="$value" ;;
             REALITY_SERVER_NAME) reality_server_name="$value" ;;
+            REALITY_PRIVATE_KEY) reality_private_key="$value" ;;
             REALITY_PUBLIC_KEY) reality_public_key="$value" ;;
             REALITY_SHORT_ID) reality_short_id="$value" ;;
             FINGERPRINT) fingerprint="$value" ;;
+            CONFIG_ID) config_id="$value" ;;
         esac
-    done < "$STATE_FILE"
+    done < "$file"
 
     is_valid_node_host "$domain" || return 1
     [ -n "$name" ] && [ "$(sanitize_name "$name")" = "$name" ] || return 1
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    [ "$protocol" = "$expected_protocol" ] || return 1
+    [[ "$config_id" =~ ^[0-9a-f]{24}$ ]] || return 1
     case "$protocol" in
         shadowsocks)
             [[ "$password" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
-            [ "$method" = "$METHOD" ] || return 1
+            [ "$method" = "$SS_METHOD" ] || return 1
             ;;
         vless-reality)
             [[ "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || return 1
             [ "$flow" = "xtls-rprx-vision" ] || return 1
             is_domain_name "$reality_server_name" || return 1
+            [[ "$reality_private_key" =~ ^[A-Za-z0-9_-]{40,60}$ ]] || return 1
             [[ "$reality_public_key" =~ ^[A-Za-z0-9_-]{40,60}$ ]] || return 1
             [[ "$reality_short_id" =~ ^[0-9A-Fa-f]{16}$ ]] || return 1
             [ "$fingerprint" = "chrome" ] || return 1
@@ -1983,17 +2040,224 @@ load_state() {
     UUID="$uuid"
     FLOW="$flow"
     REALITY_SERVER_NAME="$reality_server_name"
+    REALITY_PRIVATE_KEY="$reality_private_key"
     REALITY_PUBLIC_KEY="$reality_public_key"
     REALITY_SHORT_ID="$reality_short_id"
     FINGERPRINT="$fingerprint"
+    CONFIG_ID="$config_id"
+}
+
+node_config_matches_loaded_state() {
+    local protocol="$1"
+    local config="$2"
+
+    command -v jq >/dev/null 2>&1 || return 1
+    node_file_is_secure "$config" || return 1
+    case "$protocol" in
+        ss)
+            jq -e \
+                --argjson port "$PORT" \
+                --arg method "$METHOD" \
+                --arg password "$PASSWORD" \
+                --arg config_id "$CONFIG_ID" '
+                (.inbounds | type == "array" and length > 0) and
+                all(.inbounds[];
+                    .type == "shadowsocks" and
+                    .listen_port == $port and
+                    .method == $method and
+                    .password == $password and
+                    (.tag | type == "string" and contains($config_id))
+                ) and
+                ((.outbounds | type == "array" and length > 0) and
+                 all(.outbounds[]; .tag | type == "string" and contains($config_id)))
+            ' "$config" >/dev/null 2>&1
+            ;;
+        vless)
+            jq -e \
+                --argjson port "$PORT" \
+                --arg uuid "$UUID" \
+                --arg flow "$FLOW" \
+                --arg server_name "$REALITY_SERVER_NAME" \
+                --arg private_key "${REALITY_PRIVATE_KEY:-}" \
+                --arg short_id "$REALITY_SHORT_ID" \
+                --arg config_id "$CONFIG_ID" '
+                (.inbounds | type == "array" and length > 0) and
+                all(.inbounds[];
+                    .type == "vless" and
+                    .listen_port == $port and
+                    any(.users[]?; .uuid == $uuid and .flow == $flow) and
+                    .tls.enabled == true and
+                    .tls.server_name == $server_name and
+                    .tls.reality.enabled == true and
+                    .tls.reality.handshake.server == $server_name and
+                    .tls.reality.private_key == $private_key and
+                    any(.tls.reality.short_id[]?; . == $short_id) and
+                    (.tag | type == "string" and contains($config_id))
+                ) and
+                ((.outbounds | type == "array" and length > 0) and
+                 all(.outbounds[]; .tag | type == "string" and contains($config_id)))
+            ' "$config" >/dev/null 2>&1
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+node_uri_matches_loaded_state() {
+    local uri="$1"
+    local expected
+
+    [ -e "$uri" ] || return 0
+    node_file_is_secure "$uri" || return 1
+    expected="$(generate_link_from_loaded_state)" || return 1
+    [ "$(wc -l < "$uri")" -eq 1 ] && [ "$(cat "$uri")" = "$expected" ]
+}
+
+validate_protocol_node_artifacts() {
+    local protocol="$1"
+    local config="${2:-}"
+    local state="${3:-}"
+    local uri="${4:-}"
+    local expected
+
+    [ -n "$config" ] || config="$(node_config_path "$protocol")" || return 2
+    [ -n "$state" ] || state="$(node_state_path "$protocol")" || return 2
+    [ -n "$uri" ] || uri="$(node_uri_path "$protocol")" || return 2
+    case "$protocol" in
+        ss) expected=shadowsocks ;;
+        vless) expected=vless-reality ;;
+        *) return 2 ;;
+    esac
+    node_file_is_secure "$state" || return 1
+    load_state_file "$state" "$expected" || return 1
+    node_config_matches_loaded_state "$protocol" "$config" || return 1
+    node_uri_matches_loaded_state "$uri"
+}
+
+protocol_node_exists() {
+    local protocol="$1" config state
+
+    config="$(node_config_path "$protocol")" || return 2
+    state="$(node_state_path "$protocol")" || return 2
+    case "$protocol" in
+        ss|vless) ;;
+        *) return 2 ;;
+    esac
+    [ -f "$config" ] && [ ! -L "$config" ] &&
+        [ -f "$state" ] && [ ! -L "$state" ] &&
+        validate_protocol_node_artifacts "$protocol" "$config" "$state" "$(node_uri_path "$protocol")" >/dev/null 2>&1
+}
+
+protocol_visible_exists() {
+    protocol_node_exists "$1"
+}
+
+load_protocol_state() {
+    local protocol="$1" state expected
+
+    state="$(node_state_path "$protocol")" || return 2
+    case "$protocol" in
+        ss) expected=shadowsocks ;;
+        vless) expected=vless-reality ;;
+        *) return 2 ;;
+    esac
+    protocol_node_exists "$protocol" || return 1
+    load_state_file "$state" "$expected"
+}
+
+node_exists() {
+    protocol_node_exists ss || protocol_node_exists vless
+}
+
+node_artifacts_present() {
+    [ -e "$URI_FILE" ] || [ -e "$NODE_CONFIG_DIR" ] ||
+        [ -e "$SS_STATE_FILE" ] || [ -e "$VLESS_STATE_FILE" ] ||
+        [ -e "$SS_URI_FILE" ] || [ -e "$VLESS_URI_FILE" ]
+}
+
+node_config_dir_contents_valid() {
+    local path entries
+
+    [ -e "$NODE_CONFIG_DIR" ] || return 0
+    node_dir_is_secure "$NODE_CONFIG_DIR" || return 1
+    entries="$(find "$NODE_CONFIG_DIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" || return 1
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        case "$path" in
+            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH") ;;
+            *) return 1 ;;
+        esac
+        node_file_is_secure "$path" || return 1
+    done <<< "$entries"
+}
+
+aggregate_uri_matches_nodes() {
+    local protocol expected="" link
+
+    [ -e "$URI_FILE" ] || return 0
+    node_file_is_secure "$URI_FILE" || return 1
+    for protocol in ss vless; do
+        protocol_node_exists "$protocol" || continue
+        link="$(generate_protocol_link "$protocol")" || return 1
+        [ -n "$expected" ] && expected="${expected}"$'\n'
+        expected="${expected}${link}"
+    done
+    [ -n "$expected" ] && [ "$(cat "$URI_FILE")" = "$expected" ]
+}
+
+require_valid_node_state_if_present() {
+    local has_core=0 protocol label config state uri
+    local path
+
+    for path in "$URI_FILE" "$NODE_CONFIG_DIR" "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH" \
+        "$SS_STATE_FILE" "$VLESS_STATE_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
+        if [ -L "$path" ]; then
+            err "检测到节点路径为符号链接，已拒绝继续：$path"
+            return 1
+        fi
+    done
+    node_config_dir_contents_valid || {
+        err "节点配置目录包含未知、残缺或不安全的文件：$NODE_CONFIG_DIR"
+        return 1
+    }
+
+    for protocol in ss vless; do
+        label="$(node_protocol_display_name "$protocol")" || return 1
+        config="$(node_config_path "$protocol")" || return 1
+        state="$(node_state_path "$protocol")" || return 1
+        uri="$(node_uri_path "$protocol")" || return 1
+        if [ -e "$config" ] || [ -e "$state" ]; then
+            [ -f "$config" ] && [ -f "$state" ] &&
+                validate_protocol_node_artifacts "$protocol" "$config" "$state" "$uri" || {
+                err "检测到 $label 节点配置残缺、不安全或内容无效。"
+                err "请检查 $config 与 $state。"
+                return 1
+            }
+            has_core=1
+        fi
+        if [ -e "$uri" ] && ! protocol_node_exists "$protocol"; then
+            err "检测到没有对应节点状态的孤立链接文件：$uri"
+            return 1
+        fi
+    done
+
+    if [ "$has_core" -eq 0 ] &&
+        { [ -e "$URI_FILE" ] || [ -e "$SS_URI_FILE" ] || [ -e "$VLESS_URI_FILE" ]; }; then
+        err "检测到孤立的节点链接文件，已拒绝继续以免误判节点状态。"
+        return 1
+    fi
+    if [ "$has_core" -eq 1 ] && ! aggregate_uri_matches_nodes; then
+        err "检测到汇总节点链接与独立节点状态不一致：$URI_FILE"
+        return 1
+    fi
 }
 
 commit_node_state_file() {
     local tmp="$1"
+    local dest="$2"
 
     if ! chown root:root "$tmp" ||
         ! chmod 600 "$tmp" ||
-        ! mv -f -- "$tmp" "$STATE_FILE"; then
+        ! mv -f -- "$tmp" "$dest"; then
         rm -f -- "$tmp"
         return 1
     fi
@@ -2004,38 +2268,48 @@ save_state() {
     local name="$2"
     local port="$3"
     local password="$4"
+    local config_id="$5"
+    local dest="${6:-$SS_STATE_FILE}"
     local tmp
 
+    [[ "$config_id" =~ ^[0-9a-f]{24}$ ]] || return 1
     secure_config_dir || return 1
-    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-state.XXXXXX")" || return 1
+    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-ss-state.XXXXXX")" || return 1
     if ! {
         printf 'PROTOCOL=shadowsocks\n' &&
+            printf 'CONFIG_ID=%s\n' "$config_id" &&
             printf 'DOMAIN=%s\n' "$domain" &&
             printf 'NAME=%s\n' "$name" &&
             printf 'PORT=%s\n' "$port" &&
             printf 'PASSWORD=%s\n' "$password" &&
-            printf 'METHOD=%s\n' "$METHOD"
+            printf 'METHOD=%s\n' "$SS_METHOD"
     } > "$tmp"; then
         rm -f -- "$tmp"
         return 1
     fi
-    commit_node_state_file "$tmp"
+    commit_node_state_file "$tmp" "$dest"
 }
 
 save_vless_reality_state() {
-    local domain="$1" name="$2" port="$3" uuid="$4" server_name="$5" public_key="$6" short_id="$7"
+    local domain="$1" name="$2" port="$3" uuid="$4" server_name="$5"
+    local private_key="$6" public_key="$7" short_id="$8"
+    local config_id="$9"
+    local dest="${10:-$VLESS_STATE_FILE}"
     local tmp
 
+    [[ "$config_id" =~ ^[0-9a-f]{24}$ ]] || return 1
     secure_config_dir || return 1
-    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-state.XXXXXX")" || return 1
+    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-vless-state.XXXXXX")" || return 1
     if ! {
         printf 'PROTOCOL=vless-reality\n' &&
+            printf 'CONFIG_ID=%s\n' "$config_id" &&
             printf 'DOMAIN=%s\n' "$domain" &&
             printf 'NAME=%s\n' "$name" &&
             printf 'PORT=%s\n' "$port" &&
             printf 'UUID=%s\n' "$uuid" &&
             printf 'FLOW=xtls-rprx-vision\n' &&
             printf 'REALITY_SERVER_NAME=%s\n' "$server_name" &&
+            printf 'REALITY_PRIVATE_KEY=%s\n' "$private_key" &&
             printf 'REALITY_PUBLIC_KEY=%s\n' "$public_key" &&
             printf 'REALITY_SHORT_ID=%s\n' "$short_id" &&
             printf 'FINGERPRINT=chrome\n'
@@ -2043,7 +2317,7 @@ save_vless_reality_state() {
         rm -f -- "$tmp"
         return 1
     fi
-    commit_node_state_file "$tmp"
+    commit_node_state_file "$tmp" "$dest"
 }
 
 normalize_host() {
@@ -2298,15 +2572,14 @@ url_encode_userinfo() {
               -e 's/=/%3D/g'
 }
 
-generate_link() {
+generate_link_from_loaded_state() {
     local host
     local encoded
 
-    load_state || return 1
     host="$(uri_host "${DOMAIN:-}")" || return 1
     case "${PROTOCOL:-shadowsocks}" in
         shadowsocks)
-            encoded="$(url_encode_userinfo "${METHOD:-$METHOD}:${PASSWORD:-}")" || return 1
+            encoded="$(url_encode_userinfo "${METHOD:-$SS_METHOD}:${PASSWORD:-}")" || return 1
             printf 'ss://%s@%s:%s#%s\n' "$encoded" "$host" "${PORT:-0}" "${NAME:-ss}"
             ;;
         vless-reality)
@@ -2318,27 +2591,129 @@ generate_link() {
     esac
 }
 
-write_uri_file() {
-    local tmp
+generate_protocol_link() {
+    load_protocol_state "$1" || return 1
+    generate_link_from_loaded_state
+}
 
-    secure_config_dir || return 1
-    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-uri.XXXXXX")" || return 1
-    if ! generate_link > "$tmp" ||
-        ! chown root:root "$tmp" ||
-        ! chmod 600 "$tmp" ||
-        ! mv -f -- "$tmp" "$URI_FILE"; then
-        rm -f -- "$tmp"
+secure_uri_build_files() {
+    local build_dir="$1"
+    local path
+
+    for path in "$build_dir"/*.txt; do
+        [ -f "$path" ] || continue
+        chown root:root "$path" && chmod 600 "$path" || return 1
+    done
+}
+
+build_current_uri_files() {
+    local build_dir="$1"
+    local aggregate="$build_dir/${URI_FILE##*/}"
+    local protocol dest tmp
+    local has_node=0
+
+    mkdir -p "$build_dir" || return 1
+    : > "$aggregate" || return 1
+    for protocol in ss vless; do
+        dest="$(node_uri_path "$protocol")" || return 1
+        tmp="$build_dir/${dest##*/}"
+        if protocol_node_exists "$protocol"; then
+            generate_protocol_link "$protocol" > "$tmp" || return 1
+            cat "$tmp" >> "$aggregate" || return 1
+            has_node=1
+        fi
+    done
+    if [ "$has_node" -eq 0 ]; then
+        rm -f -- "$aggregate" || return 1
+    fi
+    secure_uri_build_files "$build_dir"
+}
+
+restore_uri_file_group() {
+    local backup_dir="$1"
+    local dest backup
+
+    for dest in "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
+        rm -f -- "$dest" || return 1
+        backup="$backup_dir/${dest##*/}"
+        if [ -f "$backup" ]; then
+            cp -a -- "$backup" "$dest" || return 1
+        fi
+    done
+}
+
+publish_uri_file_group() {
+    local build_dir="$1"
+    local rollback_dir tmp_dir dest source tmp failed=0
+
+    rollback_dir="$(mktemp -d "$CONFIG_DIR/.vpsbox-uri-rollback.XXXXXX")" || return 1
+    tmp_dir="$(mktemp -d "$CONFIG_DIR/.vpsbox-uri-publish.XXXXXX")" || {
+        rm -rf -- "$rollback_dir"
+        return 1
+    }
+    for dest in "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
+        [ ! -L "$dest" ] || {
+            rm -rf -- "$rollback_dir" "$tmp_dir"
+            return 1
+        }
+        if [ -f "$dest" ]; then
+            cp -a -- "$dest" "$rollback_dir/${dest##*/}" || {
+                rm -rf -- "$rollback_dir" "$tmp_dir"
+                return 1
+            }
+        fi
+        source="$build_dir/${dest##*/}"
+        if [ -f "$source" ]; then
+            tmp="$tmp_dir/${dest##*/}"
+            cp -- "$source" "$tmp" &&
+                chown root:root "$tmp" &&
+                chmod 600 "$tmp" || {
+                rm -rf -- "$rollback_dir" "$tmp_dir"
+                return 1
+            }
+        fi
+    done
+    for dest in "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
+        tmp="$tmp_dir/${dest##*/}"
+        if [ -f "$tmp" ]; then
+            mv -f -- "$tmp" "$dest" || { failed=1; break; }
+        else
+            rm -f -- "$dest" || { failed=1; break; }
+        fi
+    done
+    if [ "$failed" -ne 0 ]; then
+        if ! restore_uri_file_group "$rollback_dir"; then
+            err "节点链接文件组更新失败，旧链接组也未能完整恢复。"
+        fi
+        rm -rf -- "$rollback_dir" "$tmp_dir"
         return 1
     fi
+    rm -rf -- "$rollback_dir" "$tmp_dir"
+}
+
+write_uri_files() {
+    local build_dir
+
+    secure_config_dir || return 1
+    build_dir="$(mktemp -d "$CONFIG_DIR/.vpsbox-uri-build.XXXXXX")" || return 1
+    if ! build_current_uri_files "$build_dir" ||
+        ! publish_uri_file_group "$build_dir"; then
+        rm -rf -- "$build_dir"
+        return 1
+    fi
+    rm -rf -- "$build_dir"
 }
 
 backup_node_files() {
     local backup_dir="$1"
     mkdir -p "$backup_dir" || return 1
 
-    if [ -f "$CONFIG_PATH" ]; then cp -a "$CONFIG_PATH" "$backup_dir/config.json" || return 1; fi
-    if [ -f "$STATE_FILE" ]; then cp -a "$STATE_FILE" "$backup_dir/state.env" || return 1; fi
     if [ -f "$URI_FILE" ]; then cp -a "$URI_FILE" "$backup_dir/node-uri.txt" || return 1; fi
+    if [ -d "$NODE_CONFIG_DIR" ]; then cp -a "$NODE_CONFIG_DIR" "$backup_dir/vpsbox.d" || return 1; fi
+    if [ -f "$SS_STATE_FILE" ]; then cp -a "$SS_STATE_FILE" "$backup_dir/ss-state.env" || return 1; fi
+    if [ -f "$VLESS_STATE_FILE" ]; then cp -a "$VLESS_STATE_FILE" "$backup_dir/vless-state.env" || return 1; fi
+    if [ -f "$SS_URI_FILE" ]; then cp -a "$SS_URI_FILE" "$backup_dir/ss-uri.txt" || return 1; fi
+    if [ -f "$VLESS_URI_FILE" ]; then cp -a "$VLESS_URI_FILE" "$backup_dir/vless-uri.txt" || return 1; fi
     if [ -f /etc/systemd/system/sing-box.service ]; then cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service" || return 1; fi
     if [ -f /etc/init.d/sing-box ]; then cp -a /etc/init.d/sing-box "$backup_dir/openrc-sing-box" || return 1; fi
 
@@ -2354,6 +2729,93 @@ backup_node_files() {
     fi
 }
 
+node_transaction_dir_valid() {
+    [ "${1:-}" = "$NODE_TRANSACTION_DIR" ] &&
+        [ "$NODE_TRANSACTION_DIR" = "$VPSBOX_STATE_DIR/node-transaction" ]
+}
+
+remove_node_transaction_dir() {
+    local transaction_dir="${1:-$NODE_TRANSACTION_DIR}"
+
+    node_transaction_dir_valid "$transaction_dir" || {
+        err "节点事务目录异常，已拒绝递归清理：$transaction_dir"
+        return 1
+    }
+    [ ! -L "$transaction_dir" ] || {
+        err "节点事务目录是符号链接，已拒绝清理：$transaction_dir"
+        return 1
+    }
+    rm -rf -- "$transaction_dir"
+}
+
+prepare_node_transaction_store() {
+    [ ! -L "$VPSBOX_STATE_DIR" ] && [ ! -L "$NODE_TRANSACTION_DIR" ] || {
+        err "节点事务路径包含符号链接，已拒绝使用。"
+        return 1
+    }
+    mkdir -p "$VPSBOX_STATE_DIR" || return 1
+    chown root:root "$VPSBOX_STATE_DIR" || return 1
+    chmod 700 "$VPSBOX_STATE_DIR"
+}
+
+begin_node_transaction() {
+    prepare_node_transaction_store || return 1
+    if [ -e "$NODE_TRANSACTION_DIR/pending" ]; then
+        err "检测到尚未恢复的节点事务，已拒绝开始新操作：$NODE_TRANSACTION_DIR"
+        return 1
+    fi
+    if [ -e "$NODE_TRANSACTION_DIR/committed" ]; then
+        node_file_is_secure "$NODE_TRANSACTION_DIR/committed" || {
+            err "节点事务 committed 标记不安全，已拒绝开始新操作。"
+            return 1
+        }
+        remove_node_transaction_dir || return 1
+    elif [ -e "$NODE_TRANSACTION_DIR" ]; then
+        # pending 标记只会在完整备份后写入；没有标记说明尚未修改节点文件。
+        remove_node_transaction_dir || return 1
+    fi
+    mkdir -p "$NODE_TRANSACTION_BACKUP" "$NODE_TRANSACTION_STAGE" || {
+        remove_node_transaction_dir || true
+        return 1
+    }
+    chown root:root "$NODE_TRANSACTION_DIR" "$NODE_TRANSACTION_BACKUP" "$NODE_TRANSACTION_STAGE" || {
+        remove_node_transaction_dir || true
+        return 1
+    }
+    chmod 700 "$NODE_TRANSACTION_DIR" "$NODE_TRANSACTION_BACKUP" "$NODE_TRANSACTION_STAGE" || {
+        remove_node_transaction_dir || true
+        return 1
+    }
+    if ! backup_node_files "$NODE_TRANSACTION_BACKUP"; then
+        remove_node_transaction_dir || true
+        return 1
+    fi
+    : > "$NODE_TRANSACTION_DIR/pending" || {
+        remove_node_transaction_dir || true
+        return 1
+    }
+    chown root:root "$NODE_TRANSACTION_DIR/pending" &&
+        chmod 600 "$NODE_TRANSACTION_DIR/pending" || {
+        remove_node_transaction_dir || true
+        return 1
+    }
+    ACTIVE_NODE_BACKUP="$NODE_TRANSACTION_DIR"
+}
+
+commit_node_transaction() {
+    [ "${ACTIVE_NODE_BACKUP:-}" = "$NODE_TRANSACTION_DIR" ] || return 1
+    [ -f "$NODE_TRANSACTION_DIR/pending" ] && [ ! -L "$NODE_TRANSACTION_DIR/pending" ] || return 1
+    : > "$NODE_TRANSACTION_DIR/committed" || return 1
+    chown root:root "$NODE_TRANSACTION_DIR/committed" &&
+        chmod 600 "$NODE_TRANSACTION_DIR/committed" || return 1
+    rm -f -- "$NODE_TRANSACTION_DIR/pending" || return 1
+    ACTIVE_NODE_BACKUP=""
+    remove_node_transaction_dir || {
+        warn "节点事务已提交，但临时目录未能清理：$NODE_TRANSACTION_DIR"
+        return 0
+    }
+}
+
 restore_node_files() {
     local backup_dir="$1"
     local was_running="0"
@@ -2363,14 +2825,28 @@ restore_node_files() {
     [ -f "$backup_dir/service-running" ] && was_running="$(cat "$backup_dir/service-running")"
     [ -f "$backup_dir/service-enabled" ] && was_enabled="$(cat "$backup_dir/service-enabled")"
 
-    warn "操作未完成，正在恢复旧节点配置..."
+    warn "操作未完成，正在恢复操作前的节点配置..."
     service_stop 2>/dev/null || true
     stop_singbox_config_processes 2>/dev/null || true
+    if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
+        err "sing-box 服务或残留进程未能停止，已拒绝覆盖节点文件。"
+        err "事务备份已保留：$backup_dir"
+        return 1
+    fi
 
-    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" || failed=1
-    if [ -f "$backup_dir/config.json" ]; then cp -a "$backup_dir/config.json" "$CONFIG_PATH" || failed=1; fi
-    if [ -f "$backup_dir/state.env" ]; then cp -a "$backup_dir/state.env" "$STATE_FILE" || failed=1; fi
+    [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] || {
+        err "节点配置目录异常，已拒绝递归恢复：$NODE_CONFIG_DIR"
+        return 1
+    }
+    rm -rf -- "$NODE_CONFIG_DIR" || failed=1
+    rm -f "$URI_FILE" \
+        "$SS_STATE_FILE" "$VLESS_STATE_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE" || failed=1
     if [ -f "$backup_dir/node-uri.txt" ]; then cp -a "$backup_dir/node-uri.txt" "$URI_FILE" || failed=1; fi
+    if [ -d "$backup_dir/vpsbox.d" ]; then cp -a "$backup_dir/vpsbox.d" "$NODE_CONFIG_DIR" || failed=1; fi
+    if [ -f "$backup_dir/ss-state.env" ]; then cp -a "$backup_dir/ss-state.env" "$SS_STATE_FILE" || failed=1; fi
+    if [ -f "$backup_dir/vless-state.env" ]; then cp -a "$backup_dir/vless-state.env" "$VLESS_STATE_FILE" || failed=1; fi
+    if [ -f "$backup_dir/ss-uri.txt" ]; then cp -a "$backup_dir/ss-uri.txt" "$SS_URI_FILE" || failed=1; fi
+    if [ -f "$backup_dir/vless-uri.txt" ]; then cp -a "$backup_dir/vless-uri.txt" "$VLESS_URI_FILE" || failed=1; fi
 
     if is_systemd; then
         if [ -f "$backup_dir/sing-box.service" ]; then
@@ -2389,39 +2865,39 @@ restore_node_files() {
         fi
     fi
 
-    if [ "$was_enabled" = "1" ]; then
-        service_enable 2>/dev/null || failed=1
-    else
-        service_disable 2>/dev/null || true
-    fi
-
-    if [ "$was_running" = "1" ] && [ -f "$CONFIG_PATH" ] && singbox_installed; then
-        if restart_singbox_cleanly 2>/dev/null; then
-            :
-        else
-            failed=1
-        fi
-    fi
+    restore_singbox_service_state "$was_enabled" "$was_running" 2>/dev/null || failed=1
 
     if [ "$failed" -ne 0 ]; then
-        err "旧节点恢复不完整，备份已保留：$backup_dir"
+        err "操作前的节点配置恢复不完整，备份已保留：$backup_dir"
         return 1
     fi
     info "已恢复到创建前状态。"
-    rm -rf "$backup_dir"
 }
 
 rollback_node_files_transaction() {
-    local backup="${ACTIVE_NODE_BACKUP:-}"
+    local transaction_dir="${ACTIVE_NODE_BACKUP:-}"
+
+    [ -n "$transaction_dir" ] || return 0
+    node_transaction_dir_valid "$transaction_dir" || return 1
+    [ -f "$transaction_dir/pending" ] || return 1
+    if ! restore_node_files "$transaction_dir/backup"; then
+        return 1
+    fi
     ACTIVE_NODE_BACKUP=""
-    [ -n "$backup" ] || return 0
-    restore_node_files "$backup"
+    remove_node_transaction_dir "$transaction_dir"
 }
 
 rollback_active_node_transaction() {
+    local transaction_dir="${ACTIVE_NODE_BACKUP:-}"
     local failed=0 had_firewall_transition=0
+
+    [ -n "$transaction_dir" ] || return 0
+    node_transaction_dir_valid "$transaction_dir" || return 1
     [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ] && had_firewall_transition=1
-    rollback_node_files_transaction || failed=1
+    if ! restore_node_files "$transaction_dir/backup"; then
+        ACTIVE_NODE_BACKUP=""
+        return 1
+    fi
     if [ "$had_firewall_transition" -eq 1 ] &&
         declare -F firewall_abort_port_transition >/dev/null 2>&1; then
         firewall_abort_port_transition || {
@@ -2434,12 +2910,64 @@ rollback_active_node_transaction() {
             failed=1
         }
     fi
-    [ "$failed" -eq 0 ]
+    ACTIVE_NODE_BACKUP=""
+    if [ "$failed" -ne 0 ]; then
+        err "节点文件已恢复，但事务未完整结束；备份已保留：$transaction_dir"
+        return 1
+    fi
+    remove_node_transaction_dir "$transaction_dir"
 }
 
-cleanup_node_backup() {
-    local backup_dir="$1"
-    rm -rf "$backup_dir"
+recover_pending_node_transaction() {
+    local had_pending=0
+
+    [ -e "$NODE_TRANSACTION_DIR" ] || return 0
+    prepare_node_transaction_store || return 1
+    node_transaction_dir_valid "$NODE_TRANSACTION_DIR" || return 1
+    [ -d "$NODE_TRANSACTION_DIR" ] && [ ! -L "$NODE_TRANSACTION_DIR" ] || {
+        err "节点事务目录不安全，已拒绝启动：$NODE_TRANSACTION_DIR"
+        return 1
+    }
+    if [ -f "$NODE_TRANSACTION_DIR/committed" ]; then
+        node_file_is_secure "$NODE_TRANSACTION_DIR/committed" || {
+            err "节点事务 committed 标记不安全，已拒绝自动处理。"
+            return 1
+        }
+        remove_node_transaction_dir
+        return
+    fi
+    if [ -f "$NODE_TRANSACTION_DIR/pending" ]; then
+        node_file_is_secure "$NODE_TRANSACTION_DIR/pending" || {
+            err "节点事务 pending 标记不安全，已拒绝自动恢复。"
+            return 1
+        }
+        had_pending=1
+    fi
+    if [ "$had_pending" -eq 0 ]; then
+        # 没有 pending 表示上次只创建了未完成备份，尚未开始修改节点。
+        remove_node_transaction_dir
+        return
+    fi
+    [ -d "$NODE_TRANSACTION_BACKUP" ] && [ ! -L "$NODE_TRANSACTION_BACKUP" ] || {
+        err "待恢复节点事务缺少可信备份，已拒绝启动。"
+        return 1
+    }
+    warn "检测到上次未提交的节点事务，正在优先恢复..."
+    ACTIVE_NODE_BACKUP="$NODE_TRANSACTION_DIR"
+    if ! restore_node_files "$NODE_TRANSACTION_BACKUP"; then
+        ACTIVE_NODE_BACKUP=""
+        err "未提交节点事务恢复失败，备份已保留；修复前禁止继续覆盖节点文件。"
+        return 1
+    fi
+    if declare -F firewall_refresh_if_enabled >/dev/null 2>&1 &&
+        ! firewall_refresh_if_enabled; then
+        ACTIVE_NODE_BACKUP=""
+        err "原节点已恢复，但主机防火墙同步失败；事务备份已保留。"
+        return 1
+    fi
+    ACTIVE_NODE_BACKUP=""
+    remove_node_transaction_dir || return 1
+    info "未提交节点事务已完整恢复。"
 }
 
 port_in_use_tcp() {
@@ -2472,12 +3000,8 @@ port_in_use() {
 port_conflicts_with_existing_node() {
     local port="$1" desired="$2" existing="$3"
 
-    case "$desired:$existing" in
-        tcp:tcp|tcp:both|udp:udp|udp:both|both:both) return 1 ;;
-        both:tcp) port_in_use_udp "$port" ;;
-        both:udp) port_in_use_tcp "$port" ;;
-        *) port_in_use_for_protocols "$port" "$desired" ;;
-    esac
+    [ "$desired" = "$existing" ] && return 1
+    port_in_use_for_protocols "$port" "$desired"
 }
 
 port_listener_ready() {
@@ -2533,7 +3057,7 @@ listen_mode() {
 }
 
 random_port() {
-    local port docker_ports protocols="${2:-both}"
+    local port docker_ports protocols="${2:-both}" reserved_node_ports="${3:-}"
     local i
     if [ "$#" -ge 1 ]; then
         docker_ports="$1"
@@ -2547,7 +3071,8 @@ random_port() {
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
         if ! port_in_use_for_protocols "$port" "$protocols" &&
             ! port_is_effective_ssh_port "$port" &&
-            ! csv_contains_port "$docker_ports" "$port"; then
+            ! csv_contains_port "$docker_ports" "$port" &&
+            ! csv_contains_port "$reserved_node_ports" "$port"; then
             echo "$port"
             return 0
         fi
@@ -2601,7 +3126,8 @@ port_is_effective_ssh_port() {
 
 choose_node_port() {
     local existing_port="${1:-}" protocols="${2:-both}" existing_protocols="${3:-}"
-    local input confirm docker_ports
+    local reserved_node_ports="${4:-}"
+    local input confirm docker_ports managed_pids
 
     docker_ports="$(docker_reserved_ports_for_port_choice "$protocols")" || {
         err "无法可靠读取 Docker 已发布端口，已取消节点端口选择。"
@@ -2616,7 +3142,7 @@ choose_node_port() {
         fi
         read -r input || return 1
         if [ -z "$input" ]; then
-            random_port "$docker_ports" "$protocols"
+            random_port "$docker_ports" "$protocols" "$reserved_node_ports"
             return $?
         fi
         if ! is_valid_port "$input"; then
@@ -2627,9 +3153,18 @@ choose_node_port() {
             err "端口 $input 是当前 SSH 生效端口，不能用于节点。"
             continue
         fi
+        if csv_contains_port "$reserved_node_ports" "$input"; then
+            err "端口 $input 已被另一个节点使用，请更换。"
+            continue
+        fi
+        managed_pids="$(singbox_config_pids || true)"
         if { [ "$input" = "$existing_port" ] &&
-            port_conflicts_with_existing_node "$input" "$protocols" "$existing_protocols"; } ||
-            { [ "$input" != "$existing_port" ] && port_in_use_for_protocols "$input" "$protocols"; }; then
+            { { [ -n "$managed_pids" ] &&
+                port_conflicts_with_existing_node "$input" "$protocols" "$existing_protocols"; } ||
+              { [ -z "$managed_pids" ] &&
+                port_in_use_for_protocols "$input" "$protocols"; }; }; } ||
+            { [ "$input" != "$existing_port" ] &&
+                port_in_use_for_protocols "$input" "$protocols"; }; then
             err "端口 $input 已被占用，请更换。"
             continue
         fi
@@ -2644,6 +3179,18 @@ choose_node_port() {
         printf '%s\n' "$input"
         return 0
     done
+}
+
+configured_node_ports_csv() {
+    local exclude_protocol="${1:-}" protocol result=""
+
+    for protocol in ss vless; do
+        [ "$protocol" != "$exclude_protocol" ] || continue
+        if load_protocol_state "$protocol" >/dev/null 2>&1; then
+            result="$(csv_add_port "$result" "$PORT")" || return 1
+        fi
+    done
+    printf '%s\n' "$result"
 }
 
 random_password() {
@@ -2668,7 +3215,7 @@ write_shadowsocks_inbound_json() {
       "tag": "$tag",
       "listen": "$listen",
       "listen_port": $port,
-      "method": "$METHOD",
+      "method": "$SS_METHOD",
       "password": "$password"
     }$suffix
 EOF
@@ -2677,9 +3224,17 @@ EOF
 write_config() {
     local port="$1"
     local password="$2"
-    local mode
+    local config_id="$3"
+    local dest="${4:-$SS_CONFIG_PATH}"
+    local mode tmp
 
-    secure_config_dir || return 1
+    [[ "$config_id" =~ ^[0-9a-f]{24}$ ]] || return 1
+    if [ "$dest" = "$SS_CONFIG_PATH" ]; then
+        secure_node_config_dir || return 1
+    else
+        secure_config_dir || return 1
+        [ -d "${dest%/*}" ] && [ ! -L "${dest%/*}" ] || return 1
+    fi
     mode="$(listen_mode)"
 
     case "$mode" in
@@ -2694,7 +3249,8 @@ write_config() {
             ;;
     esac
 
-    cat > "$CONFIG_PATH" <<EOF
+    tmp="$(mktemp "$CONFIG_DIR/.10-ss.XXXXXX")" || return 1
+    cat > "$tmp" <<EOF
 {
   "log": {
     "level": "info",
@@ -2704,31 +3260,34 @@ write_config() {
 EOF
     case "$mode" in
         ipv6)
-            write_shadowsocks_inbound_json "vpsbox-in" "::" "$port" "$password" >> "$CONFIG_PATH"
+            write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in" "::" "$port" "$password" >> "$tmp"
             ;;
         dual)
-            write_shadowsocks_inbound_json "vpsbox-in-ipv4" "0.0.0.0" "$port" "$password" "," >> "$CONFIG_PATH"
-            write_shadowsocks_inbound_json "vpsbox-in-ipv6" "::" "$port" "$password" >> "$CONFIG_PATH"
+            write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in-ipv4" "0.0.0.0" "$port" "$password" "," >> "$tmp"
+            write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in-ipv6" "::" "$port" "$password" >> "$tmp"
             ;;
         *)
-            write_shadowsocks_inbound_json "vpsbox-in" "0.0.0.0" "$port" "$password" >> "$CONFIG_PATH"
+            write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in" "0.0.0.0" "$port" "$password" >> "$tmp"
             ;;
     esac
 
-    cat >> "$CONFIG_PATH" <<EOF
+    cat >> "$tmp" <<EOF
   ],
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct-${config_id}-ss"
     }
   ]
 }
 EOF
-    chown root:root "$CONFIG_PATH" || return 1
-    chmod 600 "$CONFIG_PATH" || return 1
-
-    sing-box check -c "$CONFIG_PATH" >/dev/null
+    if ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! sing-box check -c "$tmp" >/dev/null ||
+        ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
 }
 
 write_vless_reality_inbound_json() {
@@ -2765,9 +3324,16 @@ EOF
 }
 
 write_vless_reality_config() {
-    local port="$1" uuid="$2" server_name="$3" private_key="$4" short_id="$5" mode
+    local port="$1" uuid="$2" server_name="$3" private_key="$4" short_id="$5"
+    local config_id="$6" dest="${7:-$VLESS_CONFIG_PATH}" mode tmp
 
-    secure_config_dir || return 1
+    [[ "$config_id" =~ ^[0-9a-f]{24}$ ]] || return 1
+    if [ "$dest" = "$VLESS_CONFIG_PATH" ]; then
+        secure_node_config_dir || return 1
+    else
+        secure_config_dir || return 1
+        [ -d "${dest%/*}" ] && [ ! -L "${dest%/*}" ] || return 1
+    fi
     mode="$(listen_mode)"
     case "$mode" in
         ipv6) info "监听地址：::（IPv4/IPv6 双栈）" ;;
@@ -2775,7 +3341,8 @@ write_vless_reality_config() {
         *) info "监听地址：0.0.0.0" ;;
     esac
 
-    cat > "$CONFIG_PATH" <<EOF
+    tmp="$(mktemp "$CONFIG_DIR/.20-vless-reality.XXXXXX")" || return 1
+    cat > "$tmp" <<EOF
 {
   "log": {
     "level": "info",
@@ -2784,26 +3351,151 @@ write_vless_reality_config() {
   "inbounds": [
 EOF
     case "$mode" in
-        ipv6) write_vless_reality_inbound_json "vpsbox-vless-reality-in" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$CONFIG_PATH" ;;
+        ipv6) write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$tmp" ;;
         dual)
-            write_vless_reality_inbound_json "vpsbox-vless-reality-in-ipv4" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" "," >> "$CONFIG_PATH"
-            write_vless_reality_inbound_json "vpsbox-vless-reality-in-ipv6" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$CONFIG_PATH"
+            write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in-ipv4" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" "," >> "$tmp"
+            write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in-ipv6" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$tmp"
             ;;
-        *) write_vless_reality_inbound_json "vpsbox-vless-reality-in" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$CONFIG_PATH" ;;
+        *) write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$tmp" ;;
     esac
-    cat >> "$CONFIG_PATH" <<EOF
+    cat >> "$tmp" <<EOF
   ],
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct-${config_id}-vless"
     }
   ]
 }
 EOF
-    chown root:root "$CONFIG_PATH" || return 1
-    chmod 600 "$CONFIG_PATH" || return 1
-    sing-box check -c "$CONFIG_PATH" >/dev/null
+    if ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! sing-box check -c "$tmp" >/dev/null ||
+        ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+generate_node_config_id() {
+    local config_id
+
+    config_id="$(sing-box generate rand 12 --hex 2>/dev/null | tr -d '\r\n')" || return 1
+    [[ "$config_id" =~ ^[0-9a-f]{24}$ ]] || return 1
+    printf '%s\n' "$config_id"
+}
+
+prepare_node_stage() {
+    [ "${ACTIVE_NODE_BACKUP:-}" = "$NODE_TRANSACTION_DIR" ] || return 1
+    [ "$NODE_TRANSACTION_STAGE" = "$NODE_TRANSACTION_DIR/stage" ] || return 1
+    rm -rf -- "$NODE_TRANSACTION_STAGE" || return 1
+    mkdir -p "$NODE_TRANSACTION_STAGE/configs" \
+        "$NODE_TRANSACTION_STAGE/states" "$NODE_TRANSACTION_STAGE/uris" || return 1
+    chown -R root:root "$NODE_TRANSACTION_STAGE" || return 1
+    chmod 700 "$NODE_TRANSACTION_STAGE" "$NODE_TRANSACTION_STAGE/configs" \
+        "$NODE_TRANSACTION_STAGE/states" "$NODE_TRANSACTION_STAGE/uris"
+}
+
+stage_sibling_node_config() {
+    local target_protocol="$1"
+    local protocol source
+
+    for protocol in ss vless; do
+        [ "$protocol" != "$target_protocol" ] || continue
+        if protocol_node_exists "$protocol"; then
+            source="$(node_config_path "$protocol")" || return 1
+            cp -- "$source" "$NODE_TRANSACTION_STAGE/configs/${source##*/}" || return 1
+            chown root:root "$NODE_TRANSACTION_STAGE/configs/${source##*/}" &&
+                chmod 600 "$NODE_TRANSACTION_STAGE/configs/${source##*/}" || return 1
+        fi
+    done
+}
+
+build_staged_uri_files() {
+    local target_protocol="$1"
+    local target_state="$2"
+    local uri_dir="$NODE_TRANSACTION_STAGE/uris"
+    local aggregate="$uri_dir/${URI_FILE##*/}"
+    local protocol state expected dest
+
+    : > "$aggregate" || return 1
+    for protocol in ss vless; do
+        dest="$(node_uri_path "$protocol")" || return 1
+        if [ "$protocol" = "$target_protocol" ]; then
+            state="$target_state"
+            case "$protocol" in
+                ss) expected=shadowsocks ;;
+                vless) expected=vless-reality ;;
+                *) return 2 ;;
+            esac
+            load_state_file "$state" "$expected" || return 1
+            generate_link_from_loaded_state > "$uri_dir/${dest##*/}" || return 1
+        elif protocol_node_exists "$protocol"; then
+            generate_protocol_link "$protocol" > "$uri_dir/${dest##*/}" || return 1
+        else
+            continue
+        fi
+        cat "$uri_dir/${dest##*/}" >> "$aggregate" || return 1
+    done
+    secure_uri_build_files "$uri_dir"
+}
+
+validate_staged_node() {
+    local protocol="$1"
+    local config state uri final_path
+
+    final_path="$(node_config_path "$protocol")" || return 1
+    config="$NODE_TRANSACTION_STAGE/configs/${final_path##*/}"
+    final_path="$(node_state_path "$protocol")" || return 1
+    state="$NODE_TRANSACTION_STAGE/states/${final_path##*/}"
+    final_path="$(node_uri_path "$protocol")" || return 1
+    uri="$NODE_TRANSACTION_STAGE/uris/${final_path##*/}"
+    validate_protocol_node_artifacts "$protocol" "$config" "$state" "$uri" || return 1
+    sing-box check -C "$NODE_TRANSACTION_STAGE/configs" >/dev/null
+}
+
+publish_staged_node_file() {
+    local source="$1"
+    local dest="$2"
+    local tmp
+
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    tmp="$(mktemp "${dest}.publish.XXXXXX")" || return 1
+    if ! cp -- "$source" "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+publish_staged_node() {
+    local protocol="$1"
+    local config state
+
+    config="$(node_config_path "$protocol")" || return 1
+    state="$(node_state_path "$protocol")" || return 1
+    prepare_node_layout_for_write || return 1
+    publish_staged_node_file \
+        "$NODE_TRANSACTION_STAGE/configs/${config##*/}" "$config" || return 1
+    publish_staged_node_file \
+        "$NODE_TRANSACTION_STAGE/states/${state##*/}" "$state" || return 1
+    publish_uri_file_group "$NODE_TRANSACTION_STAGE/uris" || return 1
+    require_valid_node_state_if_present
+}
+
+check_node_config_set() {
+    [ -d "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ] || return 1
+    { [ -f "$SS_CONFIG_PATH" ] || [ -f "$VLESS_CONFIG_PATH" ]; } || return 1
+    node_config_dir_contents_valid || return 1
+    sing-box check -C "$NODE_CONFIG_DIR" >/dev/null
+}
+
+check_active_node_config() {
+    require_valid_node_state_if_present || return 1
+    node_exists || return 1
+    check_node_config_set
 }
 
 generate_reality_keypair() {
@@ -2833,6 +3525,9 @@ check_reality_server() {
 render_singbox_systemd_service() {
     local bin="$1"
 
+    require_valid_node_state_if_present || return 1
+    node_exists || return 1
+
     cat <<EOF
 [Unit]
 Description=Sing-box Proxy Server
@@ -2844,7 +3539,7 @@ Wants=network.target
 Type=simple
 User=root
 WorkingDirectory=$CONFIG_DIR
-ExecStart=$bin run -c $CONFIG_PATH
+ExecStart=$bin run -C $NODE_CONFIG_DIR
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10s
@@ -2862,12 +3557,15 @@ EOF
 render_singbox_openrc_service() {
     local bin="$1"
 
+    require_valid_node_state_if_present || return 1
+    node_exists || return 1
+
     cat <<EOF
 #!/sbin/openrc-run
 name="sing-box"
 description="Sing-box Proxy Server"
 command="$bin"
-command_args="run -c $CONFIG_PATH"
+command_args="run -C $NODE_CONFIG_DIR"
 command_background="yes"
 pidfile="/run/sing-box.pid"
 output_log="/var/log/sing-box.log"
@@ -2920,61 +3618,59 @@ setup_service() {
     fi
 }
 
-create_or_rebuild_node() {
-    local backup_dir confirm
-    local existing_port="" existing_protocols=""
-    require_valid_node_state_if_present || return 1
-    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
-    if ! backup_node_files "$backup_dir"; then
-        cleanup_node_backup "$backup_dir"
-        err "备份当前节点失败，已取消重建。"
-        return 1
-    fi
-    # 从安装 sing-box 前就纳入节点事务：官方包可能预先写入 config.json。
-    # 取消、EOF 或 Ctrl+C 时只恢复节点文件和服务状态，不卸载用户原有或本次安装的 sing-box。
-    ACTIVE_NODE_BACKUP="$backup_dir"
+prepare_node_layout_for_write() {
+    # vpsbox 服务只加载 vpsbox.d；软件包或用户自己的 config.json 不参与节点布局。
+    secure_node_config_dir
+}
 
-    if node_exists; then
+verify_all_node_runtime() {
+    local protocol protocols
+
+    service_is_running || return 1
+    for protocol in vless ss; do
+        protocol_visible_exists "$protocol" || continue
+        load_protocol_state "$protocol" || return 1
+        if [ "$protocol" = "vless" ]; then
+            [ -n "${REALITY_PRIVATE_KEY:-}" ] || return 1
+            protocols=tcp
+        else
+            protocols=both
+        fi
+        wait_for_port_listener "$PORT" "$protocols" || return 1
+    done
+}
+
+create_or_rebuild_node() {
+    local confirm domain default_name input_name name port password config_id
+    local staged_config staged_state
+    local existing_port="" existing_protocols="" sibling_ports=""
+
+    require_valid_node_state_if_present || return 1
+    if protocol_visible_exists ss; then
+        load_protocol_state ss || return 1
         existing_port="$PORT"
-        [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && existing_protocols=tcp || existing_protocols=both
-        warn "检测到已有节点。"
-        if ! read -r -p "是否覆盖重建？(y/N): " confirm; then
-            ACTIVE_NODE_BACKUP=""
-            cleanup_node_backup "$backup_dir"
+        existing_protocols=both
+        warn "检测到已有 Shadowsocks 节点。"
+        if ! read -r -p "是否覆盖重建 Shadowsocks 节点？(y/N): " confirm; then
             info "输入已结束，已取消。"
             return 1
         fi
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            ACTIVE_NODE_BACKUP=""
-            cleanup_node_backup "$backup_dir"
-            info "已取消。"
-            return 0
-        fi
+        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
     fi
 
-    if ! install_singbox_if_missing; then
-        rollback_node_files_transaction || true
-        err "sing-box 安装失败，未创建新节点。"
+    sibling_ports="$(configured_node_ports_csv ss)" || {
+        err "无法读取 VLESS Reality 节点端口，未创建 Shadowsocks 节点。"
         return 1
-    fi
-
-    local domain
-    local default_name
-    local input_name
-    local name
-    local port
-    local password
+    }
 
     if ! prompt_node_host domain "请输入节点域名或 IP（留空自动检测公网 IPv4）："; then
-        rollback_node_files_transaction || true
         info "输入已结束，已取消。"
         return 1
     fi
-
     default_name="$(default_name_for_host "$domain")"
     while true; do
         read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name ||
-            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
+            { info "输入已结束，已取消。"; return 1; }
         input_name="$(sanitize_paste_input "$input_name")"
         if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
             err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
@@ -2985,10 +3681,8 @@ create_or_rebuild_node() {
         info "已识别节点名称：$name"
         break
     done
-
-    if ! port="$(choose_node_port "$existing_port" both "$existing_protocols")"; then
-        rollback_node_files_transaction || true
-        err "节点端口选择失败，未创建新节点。"
+    if ! port="$(choose_node_port "$existing_port" both "$existing_protocols" "$sibling_ports")"; then
+        err "节点端口选择失败，未创建 Shadowsocks 节点。"
         return 1
     fi
     info "节点端口：$port"
@@ -2996,133 +3690,123 @@ create_or_rebuild_node() {
     cat <<EOF
 ----------------------------------------
  请确认节点信息
- 协议：SS 2022
+ 协议：Shadowsocks
  连接地址：$domain
  连接端口：$port
  节点名称：$name
 ----------------------------------------
 EOF
     if ! confirm_default_yes "确认无误并创建？"; then
-        rollback_node_files_transaction || true
-        info "已取消，未修改当前节点。"
+        info "已取消，未修改现有节点。"
         return 0
+    fi
+
+    # 最终确认前不创建事务、不停止服务，也不刷新防火墙；pending 写入后才允许首次修改。
+    if ! begin_node_transaction; then
+        err "无法创建受保护的节点事务，未修改 Shadowsocks 节点。"
+        return 1
+    fi
+    if ! install_singbox_if_missing; then
+        rollback_node_files_transaction || true
+        err "sing-box 安装失败，未创建 Shadowsocks 节点。"
+        return 1
     fi
     info "正在自动生成随机强密码..."
     if ! password="$(random_password)" || [ -z "$password" ]; then
         rollback_node_files_transaction || true
-        err "随机强密码生成失败，未创建新节点。"
+        err "随机强密码生成失败，未创建 Shadowsocks 节点。"
         return 1
     fi
 
-    info "加密方式：$METHOD"
-    info "正在写入配置..."
+    config_id="$(generate_node_config_id)" || {
+        rollback_node_files_transaction || true
+        err "节点配置标识生成失败，未创建 Shadowsocks 节点。"
+        return 1
+    }
+    staged_config="$NODE_TRANSACTION_STAGE/configs/${SS_CONFIG_PATH##*/}"
+    staged_state="$NODE_TRANSACTION_STAGE/states/${SS_STATE_FILE##*/}"
+    if ! prepare_node_stage ||
+        ! stage_sibling_node_config ss ||
+        ! write_config "$port" "$password" "$config_id" "$staged_config" ||
+        ! save_state "$domain" "$name" "$port" "$password" "$config_id" "$staged_state" ||
+        ! build_staged_uri_files ss "$staged_state" ||
+        ! validate_staged_node ss; then
+        rollback_node_files_transaction || true
+        err "Shadowsocks 配置、状态或链接预生成校验失败，未修改现有节点。"
+        return 1
+    fi
     if ! firewall_prepare_port_transition "$port" "$port"; then
         rollback_active_node_transaction || true
-        err "主机防火墙无法临时放行新节点端口，未创建节点。"
+        err "主机防火墙无法临时放行新节点端口，未创建 Shadowsocks 节点。"
         return 1
     fi
-    if ! write_config "$port" "$password"; then
+    info "加密方式：$SS_METHOD"
+    info "正在写入 Shadowsocks 配置..."
+    if ! publish_staged_node ss ||
+        ! check_node_config_set ||
+        ! setup_service; then
         rollback_active_node_transaction || true
-        err "配置检查失败，未创建新节点。"
-        return 1
-    fi
-
-    if ! save_state "$domain" "$name" "$port" "$password"; then
-        rollback_active_node_transaction || true
-        err "状态文件写入失败，未创建新节点。"
-        return 1
-    fi
-
-    if ! write_uri_file; then
-        rollback_active_node_transaction || true
-        err "节点链接写入失败，未创建新节点。"
-        return 1
-    fi
-
-    if ! setup_service; then
-        rollback_active_node_transaction || true
-        err "服务配置失败，未创建新节点。"
+        err "Shadowsocks 配置、状态、链接或服务写入失败，已恢复创建前状态。"
         return 1
     fi
     info "正在启动 sing-box 服务..."
-    if ! restart_singbox_cleanly; then
+    if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
         rollback_active_node_transaction || true
-        err "sing-box 启动失败，未创建新节点。"
-        return 1
-    fi
-    if ! service_is_running || ! wait_for_port_listener "$port" both; then
-        rollback_active_node_transaction || true
-        err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
+        err "sing-box 未保持运行或节点端口未完整监听，已恢复创建前状态。"
         return 1
     fi
     if ! firewall_complete_port_transition; then
         rollback_active_node_transaction || true
-        err "主机防火墙未能同步新节点端口，已恢复创建前状态。"
+        err "主机防火墙未能同步节点端口，已恢复创建前状态。"
         return 1
     fi
 
-    rm -f "${CONFIG_PATH}.bak"
-    ACTIVE_NODE_BACKUP=""
-    cleanup_node_backup "$backup_dir"
-
-    info "创建完成，节点链接如下："
-    if ! view_node_link; then
+    if ! commit_node_transaction; then
+        rollback_active_node_transaction || true
+        err "节点事务提交失败，已尝试恢复创建前状态。"
+        return 1
+    fi
+    info "Shadowsocks 节点创建完成，当前节点链接如下："
+    view_node_link || {
         err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
         return 1
-    fi
+    }
 }
 
 create_vless_reality_node() {
-    local backup_dir existing_port="" existing_protocols="" confirm domain default_name input_name name port
-    local input_sni server_name uuid short_id private_key public_key
+    local confirm domain default_name input_name name port input_sni server_name
+    local uuid short_id private_key public_key config_id staged_config staged_state
+    local existing_port="" existing_protocols="" reality_check_deferred=0
+    local sibling_ports=""
     local -a keypair
 
     require_valid_node_state_if_present || return 1
-    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
-    if ! backup_node_files "$backup_dir"; then
-        cleanup_node_backup "$backup_dir"
-        err "备份当前节点失败，已取消重建。"
-        return 1
-    fi
-    # 与 SS 流程保持同一事务边界，兼容官方包首次安装即创建默认 config.json 的行为。
-    # 回滚只清理/恢复节点文件与服务状态，不会卸载安装前已存在的 sing-box。
-    ACTIVE_NODE_BACKUP="$backup_dir"
-
-    if node_exists; then
+    if protocol_visible_exists vless; then
+        load_protocol_state vless || return 1
         existing_port="$PORT"
-        [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && existing_protocols=tcp || existing_protocols=both
-        warn "检测到已有 ${PROTOCOL:-shadowsocks} 节点。"
-        if ! read -r -p "创建 VLESS Reality 将替换当前节点，是否继续？(y/N): " confirm; then
-            ACTIVE_NODE_BACKUP=""
-            cleanup_node_backup "$backup_dir"
+        existing_protocols=tcp
+        warn "检测到已有 VLESS Reality 节点。"
+        if ! read -r -p "是否覆盖重建 VLESS Reality 节点？(y/N): " confirm; then
             info "输入已结束，已取消。"
             return 1
         fi
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            ACTIVE_NODE_BACKUP=""
-            cleanup_node_backup "$backup_dir"
-            info "已取消。"
-            return 0
-        fi
+        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
     fi
 
-    if ! install_singbox_if_missing; then
-        rollback_node_files_transaction || true
-        err "sing-box 安装失败，未创建新节点。"
+    sibling_ports="$(configured_node_ports_csv vless)" || {
+        err "无法读取 Shadowsocks 节点端口，未创建 VLESS Reality 节点。"
         return 1
-    fi
+    }
 
     if ! prompt_node_host domain "请输入节点连接地址（域名或 IP，留空自动检测公网 IPv4）："; then
-        rollback_node_files_transaction || true
         info "输入已结束，已取消。"
         return 1
     fi
-
     default_name="$(default_name_for_host "$domain")"
     default_name="vless-${default_name#ss-}"
     while true; do
         read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name ||
-            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
+            { info "输入已结束，已取消。"; return 1; }
         input_name="$(sanitize_paste_input "$input_name")"
         if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
             err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
@@ -3133,26 +3817,28 @@ create_vless_reality_node() {
         info "已识别节点名称：$name"
         break
     done
-
     while true; do
         read -r -p "请输入 Reality 目标域名/SNI（留空默认 ${DEFAULT_REALITY_SERVER_NAME}）：" input_sni ||
-            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
+            { info "输入已结束，已取消。"; return 1; }
         server_name="$(normalize_host "${input_sni:-$DEFAULT_REALITY_SERVER_NAME}")"
         if ! is_domain_name "$server_name"; then
             err "Reality 目标必须是有效域名，不能使用 IP 地址。"
             continue
         fi
-        info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
-        if ! check_reality_server "$server_name"; then
-            err "目标域名无法解析或 TLS 443 不可达，请更换。"
-            continue
+        if command -v openssl >/dev/null 2>&1; then
+            info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
+            if ! check_reality_server "$server_name"; then
+                err "目标域名无法解析或 TLS 443 不可达，请更换。"
+                continue
+            fi
+        else
+            reality_check_deferred=1
+            info "将在最终确认并补齐依赖后检查 Reality 目标。"
         fi
         break
     done
-
-    if ! port="$(choose_node_port "$existing_port" tcp "$existing_protocols")"; then
-        rollback_node_files_transaction || true
-        err "节点端口选择失败，未创建新节点。"
+    if ! port="$(choose_node_port "$existing_port" tcp "$existing_protocols" "$sibling_ports")"; then
+        err "节点端口选择失败，未创建 VLESS Reality 节点。"
         return 1
     fi
     info "节点端口：$port"
@@ -3168,20 +3854,37 @@ create_vless_reality_node() {
 ----------------------------------------
 EOF
     if ! confirm_default_yes "确认无误并创建？"; then
-        rollback_node_files_transaction || true
-        info "已取消，未修改当前节点。"
+        info "已取消，未修改现有节点。"
         return 0
+    fi
+
+    if ! begin_node_transaction; then
+        err "无法创建受保护的节点事务，未修改 VLESS Reality 节点。"
+        return 1
+    fi
+    if ! install_singbox_if_missing; then
+        rollback_node_files_transaction || true
+        err "sing-box 安装失败，未创建 VLESS Reality 节点。"
+        return 1
+    fi
+    if [ "$reality_check_deferred" -eq 1 ]; then
+        info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
+    fi
+    if ! check_reality_server "$server_name"; then
+        rollback_node_files_transaction || true
+        err "目标域名无法解析或 TLS 443 不可达，未创建 VLESS Reality 节点。"
+        return 1
     fi
     uuid="$(sing-box generate uuid 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
         rollback_node_files_transaction || true
-        err "UUID 生成失败，未创建新节点。"
+        err "UUID 生成失败，未创建 VLESS Reality 节点。"
         return 1
     fi
     mapfile -t keypair < <(generate_reality_keypair) || true
     if [ "${#keypair[@]}" -ne 2 ]; then
         rollback_node_files_transaction || true
-        err "Reality 密钥生成失败，未创建新节点。"
+        err "Reality 密钥生成失败，未创建 VLESS Reality 节点。"
         return 1
     fi
     private_key="${keypair[0]}"
@@ -3189,78 +3892,93 @@ EOF
     short_id="$(sing-box generate rand 8 --hex 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$short_id" =~ ^[0-9A-Fa-f]{16}$ ]]; then
         rollback_node_files_transaction || true
-        err "Reality Short ID 生成失败，未创建新节点。"
+        err "Reality Short ID 生成失败，未创建 VLESS Reality 节点。"
         return 1
     fi
 
-    info "正在写入 VLESS Reality 配置..."
+    config_id="$(generate_node_config_id)" || {
+        rollback_node_files_transaction || true
+        err "节点配置标识生成失败，未创建 VLESS Reality 节点。"
+        return 1
+    }
+    staged_config="$NODE_TRANSACTION_STAGE/configs/${VLESS_CONFIG_PATH##*/}"
+    staged_state="$NODE_TRANSACTION_STAGE/states/${VLESS_STATE_FILE##*/}"
+    if ! prepare_node_stage ||
+        ! stage_sibling_node_config vless ||
+        ! write_vless_reality_config \
+            "$port" "$uuid" "$server_name" "$private_key" "$short_id" \
+            "$config_id" "$staged_config" ||
+        ! save_vless_reality_state \
+            "$domain" "$name" "$port" "$uuid" "$server_name" \
+            "$private_key" "$public_key" "$short_id" "$config_id" "$staged_state" ||
+        ! build_staged_uri_files vless "$staged_state" ||
+        ! validate_staged_node vless; then
+        rollback_node_files_transaction || true
+        err "VLESS Reality 配置、状态或链接预生成校验失败，未修改现有节点。"
+        return 1
+    fi
     if ! firewall_prepare_port_transition "$port" ""; then
         rollback_active_node_transaction || true
-        err "主机防火墙无法临时放行新节点端口，未创建节点。"
+        err "主机防火墙无法临时放行新节点端口，未创建 VLESS Reality 节点。"
         return 1
     fi
-    if ! write_vless_reality_config "$port" "$uuid" "$server_name" "$private_key" "$short_id"; then
+    info "正在写入 VLESS Reality 配置..."
+    if ! publish_staged_node vless ||
+        ! check_node_config_set ||
+        ! setup_service; then
         rollback_active_node_transaction || true
-        err "配置检查失败，未创建新节点。"
-        return 1
-    fi
-    if ! save_vless_reality_state "$domain" "$name" "$port" "$uuid" "$server_name" "$public_key" "$short_id"; then
-        rollback_active_node_transaction || true
-        err "状态文件写入失败，未创建新节点。"
-        return 1
-    fi
-    if ! write_uri_file || ! setup_service; then
-        rollback_active_node_transaction || true
-        err "节点链接或服务配置失败，未创建新节点。"
+        err "VLESS Reality 配置、状态、链接或服务写入失败，已恢复创建前状态。"
         return 1
     fi
     info "正在启动 sing-box 服务..."
-    if ! restart_singbox_cleanly || ! service_is_running || ! wait_for_port_listener "$port" tcp; then
+    if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
         rollback_active_node_transaction || true
-        err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
+        err "sing-box 未保持运行或节点端口未完整监听，已恢复创建前状态。"
         return 1
     fi
     if ! firewall_complete_port_transition; then
         rollback_active_node_transaction || true
-        err "主机防火墙未能同步新节点端口，已恢复创建前状态。"
+        err "主机防火墙未能同步节点端口，已恢复创建前状态。"
         return 1
     fi
-    rm -f "${CONFIG_PATH}.bak"
-    ACTIVE_NODE_BACKUP=""
-    cleanup_node_backup "$backup_dir"
-    info "创建完成，节点链接如下："
-    if ! view_node_link; then
+
+    if ! commit_node_transaction; then
+        rollback_active_node_transaction || true
+        err "节点事务提交失败，已尝试恢复创建前状态。"
+        return 1
+    fi
+    info "VLESS Reality 节点创建完成，当前节点链接如下："
+    view_node_link || {
         err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
         return 1
-    fi
+    }
 }
 
 view_node_link() {
-    local uri
+    local protocol label uri displayed=0
 
     require_valid_node_state_if_present || return 1
-    if ! node_exists; then
-        warn "当前没有已创建的节点。"
-        return 0
-    fi
-
-    load_state || {
-        err "节点状态文件读取失败，无法生成链接。"
-        return 1
-    }
-    write_uri_file || {
+    node_exists || { warn "当前没有已创建的节点。"; return 0; }
+    write_uri_files || {
         err "节点链接生成或写入失败。"
         return 1
     }
-    uri="$(cat "$URI_FILE")" || {
-        err "节点链接文件读取失败。"
-        return 1
-    }
 
-    if [ "$PROTOCOL" = "vless-reality" ]; then
-        cat <<EOF
+    for protocol in vless ss; do
+        protocol_visible_exists "$protocol" || continue
+        label="$(node_protocol_display_name "$protocol")" || return 1
+        load_protocol_state "$protocol" || {
+            err "$label 节点状态读取失败，无法显示链接。"
+            return 1
+        }
+        uri="$(generate_link_from_loaded_state)" || {
+            err "$label 节点链接生成失败。"
+            return 1
+        }
+        if [ "$protocol" = "vless" ]; then
+            cat <<EOF
 ========================================
- 当前 VLESS Reality 节点
+ VLESS Reality 节点
 ========================================
  节点地址：${DOMAIN}:${PORT}
  Reality SNI：${REALITY_SERVER_NAME}
@@ -3270,12 +3988,10 @@ view_node_link() {
  $uri
 ========================================
 EOF
-        return 0
-    fi
-
-    cat <<EOF
+        else
+            cat <<EOF
 ========================================
- 当前 SS 节点
+ Shadowsocks 节点
 ========================================
  节点地址：${DOMAIN}:${PORT}
  加密方式：${METHOD}
@@ -3285,76 +4001,122 @@ EOF
  $uri
 ========================================
 EOF
+        fi
+        displayed=1
+    done
+    [ "$displayed" -eq 1 ]
 }
 
-delete_node() {
-    local node_port node_protocols backup_dir confirm
+delete_node_protocol() {
+    local protocol="$1" label config state uri node_port node_protocols
+    local confirm
 
+    case "$protocol" in
+        vless) label="VLESS Reality"; node_protocols=tcp ;;
+        ss) label="Shadowsocks"; node_protocols=both ;;
+        *) return 2 ;;
+    esac
     require_valid_node_state_if_present || return 1
-    if ! node_exists; then
-        warn "当前没有已创建的节点。"
+    if ! protocol_visible_exists "$protocol"; then
+        warn "当前没有已创建的 $label 节点。"
         return 0
     fi
-    load_state || {
-        err "节点状态文件不安全或内容无效，已拒绝删除。"
+    load_protocol_state "$protocol" || {
+        err "$label 节点状态不安全或内容无效，已拒绝删除。"
         return 1
     }
     node_port="$PORT"
-    [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && node_protocols=tcp || node_protocols=both
-
-    read -r -p "确认删除当前 ${PROTOCOL:-shadowsocks} 节点？sing-box 服务将停止。(y/N): " confirm
+    if ! read -r -p "确认删除 $label 节点？(y/N): " confirm; then
+        info "输入已结束，已取消。"
+        return 1
+    fi
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
 
-    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
-    if ! backup_node_files "$backup_dir"; then
-        cleanup_node_backup "$backup_dir"
+    if ! begin_node_transaction; then
         err "备份当前节点失败，已取消删除。"
         return 1
     fi
-    ACTIVE_NODE_BACKUP="$backup_dir"
     if ! firewall_prepare_port_transition "" ""; then
         rollback_active_node_transaction || true
         err "主机防火墙无法开始节点删除事务，已取消删除。"
         return 1
     fi
 
-    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
+    service_stop 2>/dev/null ||
+        warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
     if ! stop_singbox_config_processes; then
         rollback_active_node_transaction || true
         err "残留 sing-box 进程无法停止，已保留节点配置。"
         return 1
     fi
     sleep 1
-    if service_is_running; then
+    if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
         rollback_active_node_transaction || true
         err "sing-box 服务仍在运行，已保留节点配置。"
         return 1
     fi
     if port_in_use_for_protocols "$node_port" "$node_protocols"; then
         rollback_active_node_transaction || true
-        err "节点端口 $node_port 仍在监听，已保留节点配置。"
+        err "节点端口 $node_port 仍被其他进程监听，已保留节点配置。"
         return 1
     fi
-    if ! service_disable || service_is_enabled; then
-        if ! rollback_active_node_transaction; then
-            err "节点服务恢复不完整，备份已保留：$backup_dir"
-        fi
-        err "无法禁用 sing-box 开机启动，已取消删除并尝试恢复服务。"
-        return 1
-    fi
-    if ! rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" "${CONFIG_PATH}.bak"; then
+
+    config="$(node_config_path "$protocol")" || return 1
+    state="$(node_state_path "$protocol")" || return 1
+    uri="$(node_uri_path "$protocol")" || return 1
+    rm -f -- "$config" "$state" "$uri" || {
         rollback_active_node_transaction || true
-        err "节点文件删除失败，已尝试恢复删除前状态。"
+        err "$label 节点文件删除失败，已尝试恢复。"
         return 1
+    }
+    write_uri_files || {
+        rollback_active_node_transaction || true
+        err "剩余节点链接更新失败，已尝试恢复。"
+        return 1
+    }
+
+    if node_exists; then
+        if ! check_node_config_set ||
+            ! setup_service ||
+            ! restart_singbox_cleanly ||
+            ! verify_all_node_runtime; then
+            rollback_active_node_transaction || true
+            err "剩余节点恢复运行失败，已恢复删除前状态。"
+            return 1
+        fi
+    else
+        if ! service_disable || service_is_enabled; then
+            rollback_active_node_transaction || true
+            err "无法禁用 sing-box 开机启动，已恢复删除前状态。"
+            return 1
+        fi
+        [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] &&
+            rmdir "$NODE_CONFIG_DIR" 2>/dev/null || true
     fi
     if ! firewall_complete_port_transition; then
         rollback_active_node_transaction || true
-        err "主机防火墙端口同步失败，已尝试恢复删除前状态。"
+        err "主机防火墙端口同步失败，已恢复删除前状态。"
         return 1
     fi
-    ACTIVE_NODE_BACKUP=""
-    cleanup_node_backup "$backup_dir"
-    info "当前节点已删除，sing-box 服务已停止并禁用开机启动。"
+
+    if ! commit_node_transaction; then
+        rollback_active_node_transaction || true
+        err "节点删除事务提交失败，已尝试恢复删除前状态。"
+        return 1
+    fi
+    if node_exists; then
+        info "$label 节点已删除，其他节点继续运行。"
+    else
+        info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
+    fi
+}
+
+delete_vless_reality_node() {
+    delete_node_protocol vless
+}
+
+delete_node() {
+    delete_node_protocol ss
 }
 
 restore_singbox_update_backup() {
@@ -3499,12 +4261,23 @@ commit_singbox_update_transaction() {
 update_singbox() {
     local binary_path backup_dir backup_binary rollback_package old_version
     local relation new_version
-    local was_active=0 was_enabled=0
+    local was_active=0 was_enabled=0 had_nodes=0
 
     if ! singbox_installed; then
         warn "当前未安装 sing-box，已取消更新。"
         info "如需安装 sing-box，请先创建节点或启动服务。"
         return 0
+    fi
+    if node_artifacts_present; then
+        require_valid_node_state_if_present || {
+            err "节点配置完整性未通过，已拒绝更新 sing-box。"
+            return 1
+        }
+        node_exists && check_node_config_set || {
+            err "节点配置未通过当前 sing-box 检查，已拒绝更新。"
+            return 1
+        }
+        had_nodes=1
     fi
 
     binary_path="$(command -v sing-box)"
@@ -3570,8 +4343,8 @@ update_singbox() {
         return 1
     fi
 
-    if node_exists; then
-        if ! sing-box check -c "$CONFIG_PATH" >/dev/null; then
+    if [ "$had_nodes" -eq 1 ]; then
+        if ! check_node_config_set; then
             err "当前节点配置未通过新版 sing-box 检查，正在恢复旧二进制。"
             rollback_active_singbox_update || true
             return 1
@@ -8228,7 +9001,7 @@ firewall_detect_public_listeners() {
 }
 
 firewall_detect_allowed_ports() {
-    local ssh_configured_ports ssh_listening_ports known_tcp known_udp
+    local ssh_configured_ports ssh_listening_ports known_tcp known_udp protocol label
 
     ssh_configured_ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
     [ -n "$ssh_configured_ports" ] || {
@@ -8244,15 +9017,19 @@ firewall_detect_allowed_ports() {
     FW_NODE_TCP=""
     FW_NODE_UDP=""
     require_valid_node_state_if_present || return 1
-    if node_exists; then
-        load_state || return 1
+    for protocol in vless ss; do
+        protocol_visible_exists "$protocol" || continue
+        label="$(node_protocol_display_name "$protocol")" || return 1
+        load_protocol_state "$protocol" || return 1
         is_valid_port "${PORT:-}" || {
-            err "当前节点端口无效，已拒绝生成防火墙规则。"
+            err "$label 节点端口无效，已拒绝生成防火墙规则。"
             return 1
         }
-        FW_NODE_TCP="$PORT"
-        [ "${PROTOCOL:-shadowsocks}" = "shadowsocks" ] && FW_NODE_UDP="$PORT"
-    fi
+        FW_NODE_TCP="$(csv_add_port "$FW_NODE_TCP" "$PORT")" || return 1
+        if [ "$protocol" = "ss" ]; then
+            FW_NODE_UDP="$(csv_add_port "$FW_NODE_UDP" "$PORT")" || return 1
+        fi
+    done
 
     firewall_detect_docker_ports || return 1
     firewall_detect_public_listeners || return 1
@@ -10131,7 +10908,7 @@ firewall_disable() {
 }
 
 firewall_menu() {
-    local opt ssh_ports node_tcp node_udp docker_tcp docker_udp public_tcp public_udp
+    local opt ssh_ports node_tcp node_udp docker_tcp docker_udp public_tcp public_udp protocol
     local ssh_known node_tcp_known node_udp_known docker_tcp_known docker_udp_known known_tcp known_udp
 
     firewall_settle_pending_port_transition || return 1
@@ -10140,10 +10917,18 @@ firewall_menu() {
         ssh_ports="$(ssh_effective_ports_csv 2>/dev/null || echo "-")"
         node_tcp="-"
         node_udp="-"
-        if node_exists && load_state; then
-            node_tcp="$PORT"
-            [ "${PROTOCOL:-shadowsocks}" = "shadowsocks" ] && node_udp="$PORT"
-        fi
+        for protocol in vless ss; do
+            if load_protocol_state "$protocol" >/dev/null 2>&1; then
+                [ "$node_tcp" = "-" ] && node_tcp=""
+                node_tcp="$(csv_add_port "$node_tcp" "$PORT")"
+                if [ "$protocol" = "ss" ]; then
+                    [ "$node_udp" = "-" ] && node_udp=""
+                    node_udp="$(csv_add_port "$node_udp" "$PORT")"
+                fi
+            fi
+        done
+        node_tcp="${node_tcp:--}"
+        node_udp="${node_udp:--}"
         docker_tcp="-"
         docker_udp="-"
         if firewall_docker_available; then
@@ -10295,9 +11080,10 @@ resolve_host_ips() {
 run_self_check() {
     detect_os
     local has_node="0"
+    local node_integrity_failed="0"
     local max_use
     local max_file
-    local state node_protocols
+    local state node_protocols protocol label ips
 
     max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
     max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
@@ -10327,28 +11113,54 @@ EOF
         check_warn "sing-box" "未安装"
     fi
 
-    if node_artifacts_present && ! node_exists; then
-        check_fail "节点状态" "配置残缺、不安全或内容无效"
-    elif node_exists; then
-        load_state
+    if node_artifacts_present && ! require_valid_node_state_if_present >/dev/null 2>&1; then
+        node_integrity_failed="1"
+        check_fail "配置完整性" "未通过"
+    fi
+    for protocol in vless ss; do
+        load_protocol_state "$protocol" >/dev/null 2>&1 || continue
         has_node="1"
-        check_ok "当前节点" "${PROTOCOL:-shadowsocks} ${DOMAIN:-未知}:${PORT:-未知}"
-        if [ "${PROTOCOL:-}" = "vless-reality" ]; then
+        [ "$protocol" = "vless" ] && label="VLESS Reality" || label="Shadowsocks"
+        check_ok "$label 节点" "${DOMAIN:-未知}:${PORT:-未知}"
+        if [ "$protocol" = "vless" ]; then
             check_ok "Reality SNI" "${REALITY_SERVER_NAME:-未知}"
+            node_protocols=tcp
+        else
+            node_protocols=both
         fi
-    else
-        check_warn "当前节点" "未创建"
+        if port_listener_ready "$PORT" "$node_protocols"; then
+            check_ok "$label 监听" "$PORT 正在监听"
+        else
+            check_warn "$label 监听" "$PORT 未监听"
+        fi
+        if is_ip_address "$DOMAIN"; then
+            check_ok "$label 地址" "$DOMAIN"
+        elif is_valid_node_host "$DOMAIN"; then
+            ips="$(resolve_host_ips "$DOMAIN" | tr '\n' ' ')"
+            if [ -n "$ips" ]; then
+                check_ok "$label 解析" "$ips"
+            else
+                check_warn "$label 解析" "未解析到 IP"
+            fi
+        else
+            check_fail "$label 地址" "格式不正确：$DOMAIN"
+        fi
+    done
+    if [ "$has_node" != "1" ] && [ "$node_integrity_failed" != "1" ]; then
+        check_warn "节点" "未创建"
     fi
 
-    if [ -f "$CONFIG_PATH" ]; then
-        if singbox_installed && sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+    if [ "$node_integrity_failed" = "1" ]; then
+        check_fail "配置语法" "配置完整性未通过"
+    elif [ "$has_node" = "1" ] && singbox_installed; then
+        if check_active_node_config >/dev/null 2>&1; then
             check_ok "配置语法" "通过"
-        elif singbox_installed; then
-            check_fail "配置语法" "未通过"
         else
-            check_warn "配置语法" "sing-box 未安装，无法检查"
+            check_fail "配置语法" "未通过"
         fi
-    else
+    elif [ "$has_node" = "1" ]; then
+        check_warn "配置语法" "sing-box 未安装，无法检查"
+    elif ! node_artifacts_present; then
         check_warn "配置文件" "不存在"
     fi
 
@@ -10361,38 +11173,9 @@ EOF
         check_warn "服务状态" "$state"
     fi
 
-    if [ "$has_node" = "1" ] && [ -n "${PORT:-}" ]; then
-        if [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ]; then
-            node_protocols=tcp
-        else
-            node_protocols=both
-        fi
-        if port_listener_ready "$PORT" "$node_protocols"; then
-            check_ok "端口监听" "$PORT 正在监听"
-        else
-            check_warn "端口监听" "$PORT 未监听"
-        fi
-    fi
-
-    if [ "$has_node" = "1" ] && [ -n "${DOMAIN:-}" ]; then
-        if is_ip_address "$DOMAIN"; then
-            check_ok "节点地址" "$DOMAIN"
-        elif is_valid_node_host "$DOMAIN"; then
-            local ips
-            ips="$(resolve_host_ips "$DOMAIN" | tr '\n' ' ')"
-            if [ -n "$ips" ]; then
-                check_ok "域名解析" "$ips"
-            else
-                check_warn "域名解析" "未解析到 IP"
-            fi
-        else
-            check_fail "节点地址" "格式不正确：$DOMAIN"
-        fi
-    fi
-
-    if [ -s "$URI_FILE" ]; then
+    if [ "$has_node" = "1" ] && [ -s "$URI_FILE" ]; then
         check_ok "节点链接" "$URI_FILE"
-    else
+    elif [ "$has_node" = "1" ]; then
         check_warn "节点链接" "未生成"
     fi
 
@@ -11524,11 +12307,7 @@ restore_vpsbox_system_changes() {
 }
 
 verify_current_node_runtime() {
-    local protocols
-
-    load_state || return 1
-    [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && protocols=tcp || protocols=both
-    service_is_running && wait_for_port_listener "$PORT" "$protocols"
+    verify_all_node_runtime
 }
 
 start_service_action() {
@@ -11614,46 +12393,42 @@ singbox_summary_line() {
 }
 
 node_state() {
-    if node_exists; then
-        load_state
-        case "$PROTOCOL" in
-            vless-reality) echo "VLESS Reality" ;;
-            *) echo "SS 2022" ;;
-        esac
-    else
-        echo "未创建"
+    local states=""
+
+    protocol_visible_exists vless && states="VLESS Reality"
+    if protocol_visible_exists ss; then
+        [ -n "$states" ] && states="$states + Shadowsocks" || states="Shadowsocks"
     fi
+    printf '%s\n' "${states:-未创建}"
 }
 
 node_address() {
-    if ! node_exists; then
-        echo "-"
-        return
-    fi
+    local protocol addresses=""
 
-    load_state
-    if [ -n "${DOMAIN:-}" ] && [ -n "${PORT:-}" ]; then
-        echo "${DOMAIN}:${PORT}"
-    else
-        echo "-"
-    fi
+    for protocol in vless ss; do
+        if load_protocol_state "$protocol" >/dev/null 2>&1; then
+            [ -n "$addresses" ] && addresses="$addresses, "
+            addresses="${addresses}${DOMAIN}:${PORT}"
+        fi
+    done
+    printf '%s\n' "${addresses:--}"
 }
 
 node_summary() {
-    local protocol
+    local protocol label
 
-    if ! node_exists; then
-        echo " 当前节点：未创建"
+    if node_artifacts_present &&
+        ! require_valid_node_state_if_present >/dev/null 2>&1; then
+        printf '%s\n 节点状态：异常，请进入节点管理检查\n' '----------------------------------------'
         return 0
     fi
-
-    case "$PROTOCOL" in
-        vless-reality) protocol="VLESS Reality" ;;
-        *) protocol="SS 2022" ;;
-    esac
-
-    printf ' 当前节点：已创建\n 节点协议：%s\n 节点名称：%s\n 节点地址：%s\n 节点端口：%s\n' \
-        "$protocol" "$NAME" "$DOMAIN" "$PORT"
+    for protocol in vless ss; do
+        load_protocol_state "$protocol" >/dev/null 2>&1 || continue
+        [ "$protocol" = "vless" ] && label="VLESS Reality" || label="Shadowsocks"
+        printf '%s\n' '----------------------------------------'
+        printf ' %s 节点\n 状态：已创建\n 名称：%s\n 地址：%s\n 端口：%s\n' \
+            "$label" "$NAME" "$DOMAIN" "$PORT"
+    done
 }
 
 reboot_required_state() {
@@ -11813,13 +12588,14 @@ node_menu() {
 ========================================
  节点管理
 ========================================
-$(node_summary)
 $(singbox_summary_line)
+$(node_summary)
 ----------------------------------------
- [1] 创建/重建 SS 2022 节点
- [2] 创建/重建 VLESS Reality 节点
+ [1] 创建/重建 VLESS Reality 节点（推荐）
+ [2] 创建/重建 Shadowsocks 节点
  [3] 查看节点链接
- [4] 删除当前节点
+ [4] 删除 VLESS Reality 节点
+ [5] 删除 Shadowsocks 节点
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -11828,10 +12604,11 @@ EOF
         echo ""
 
         case "$opt" in
-            1) run_menu_action create_or_rebuild_node; pause ;;
-            2) run_menu_action create_vless_reality_node; pause ;;
+            1) run_menu_action create_vless_reality_node; pause ;;
+            2) run_menu_action create_or_rebuild_node; pause ;;
             3) run_menu_action view_node_link; pause ;;
-            4) run_menu_action delete_node; pause ;;
+            4) run_menu_action delete_vless_reality_node; pause ;;
+            5) run_menu_action delete_node; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -12113,6 +12890,10 @@ vpsbox_main() {
     need_root
     detect_os
     acquire_lock
+    recover_pending_node_transaction || {
+        err "节点事务未能恢复，已停止启动 vpsbox，避免覆盖现有节点。"
+        return 1
+    }
     install_self_command
     if [ -z "${PENDING_VPSBOX_UPDATE_BACKUP:-}${PENDING_VPSBOX_UPDATE_READY_FILE:-}" ]; then
         check_vpsbox_update_on_start

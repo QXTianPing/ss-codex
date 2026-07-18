@@ -99,47 +99,41 @@ test_uri_write_preserves_existing_on_failure() {
     (
         CONFIG_DIR="$TEST_TMP/uri-config"
         URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
+        SS_URI_FILE="$CONFIG_DIR/vpsbox-ss-uri.txt"
+        VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
+        : "$SS_URI_FILE" "$VLESS_URI_FILE"
         mkdir -p "$CONFIG_DIR"
         printf '%s\n' keep > "$URI_FILE"
         secure_config_dir() { return 0; }
-        generate_link() { return 42; }
+        protocol_node_exists() { [ "$1" = ss ]; }
+        generate_protocol_link() { return 42; }
 
-        if write_uri_file; then
-            fail "链接生成失败时 write_uri_file 不应成功"
+        if write_uri_files; then
+            fail "链接生成失败时 write_uri_files 不应成功"
         fi
         assert_file_contains "$URI_FILE" '^keep$' "生成失败不应截断原链接文件"
     )
 }
 
-test_node_eof_rolls_back_fresh_install_config() {
+test_node_eof_has_no_mutation() {
     local creator
 
     for creator in create_or_rebuild_node create_vless_reality_node; do
         (
-            CONFIG_DIR="$TEST_TMP/$creator-config"
-            CONFIG_PATH="$CONFIG_DIR/config.json"
-            URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
-            ACTIVE_NODE_BACKUP=""
+            local event_log="$TEST_TMP/$creator.eof-events"
+            : > "$event_log"
             require_valid_node_state_if_present() { return 0; }
-            node_exists() { return 1; }
-            backup_node_files() { mkdir -p "$1"; }
-            install_singbox_if_missing() {
-                mkdir -p "$CONFIG_DIR"
-                printf '%s\n' package-default > "$CONFIG_PATH"
-            }
-            rollback_node_files_transaction() {
-                local backup="${ACTIVE_NODE_BACKUP:-}"
-                ACTIVE_NODE_BACKUP=""
-                rm -f -- "$CONFIG_PATH"
-                rm -rf -- "$backup"
-                printf '%s\n' rolled-back > "$TEST_TMP/$creator.rollback"
-            }
+            protocol_visible_exists() { return 1; }
+            configured_node_ports_csv() { printf '\n'; }
+            begin_node_transaction() { printf 'transaction\n' >> "$event_log"; }
+            install_singbox_if_missing() { printf 'install\n' >> "$event_log"; }
+            service_stop() { printf 'stop\n' >> "$event_log"; }
+            firewall_refresh_if_enabled() { printf 'firewall\n' >> "$event_log"; }
 
             if "$creator" </dev/null >"$TEST_TMP/$creator.out" 2>&1; then
                 fail "$creator 在 EOF 取消时应返回失败"
             fi
-            [ ! -e "$CONFIG_PATH" ] || fail "$creator 留下了阻塞后续创建的默认配置"
-            assert_file_contains "$TEST_TMP/$creator.rollback" '^rolled-back$'
+            assert_empty_file "$event_log" "$creator 在 EOF 前不得开始节点事务"
         )
     done
 }
@@ -150,9 +144,8 @@ test_interactive_confirm_is_function_local() {
         PORT=20000
         PROTOCOL=shadowsocks
         require_valid_node_state_if_present() { return 0; }
-        backup_node_files() { mkdir -p "$1"; }
-        cleanup_node_backup() { rm -rf -- "$1"; }
-        node_exists() { return 0; }
+        protocol_visible_exists() { [ "$1" = ss ]; }
+        load_protocol_state() { PORT=20000; PROTOCOL=shadowsocks; }
 
         create_or_rebuild_node <<< n >"$TEST_TMP/create-confirm.out" 2>&1 ||
             fail "取消覆盖节点应正常返回"
@@ -162,10 +155,11 @@ test_interactive_confirm_is_function_local() {
     (
         confirm=sentinel
         require_valid_node_state_if_present() { return 0; }
-        node_exists() { return 0; }
-        load_state() {
+        protocol_visible_exists() { [ "$1" = ss ]; }
+        load_protocol_state() {
             PORT=20000
             PROTOCOL=shadowsocks
+            : "$PORT" "$PROTOCOL"
         }
 
         delete_node <<< n >"$TEST_TMP/delete-confirm.out" 2>&1 ||
@@ -188,15 +182,18 @@ test_ss_password_generation_failure_rolls_back_before_mutation() {
     (
         local event_log="$TEST_TMP/password-failure-events"
         CONFIG_DIR="$TEST_TMP/password-failure-config"
-        CONFIG_PATH="$CONFIG_DIR/config.json"
         URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
         ACTIVE_NODE_BACKUP=""
         : > "$event_log"
 
         require_valid_node_state_if_present() { return 0; }
-        node_exists() { return 1; }
-        backup_node_files() { mkdir -p "$1"; }
+        protocol_visible_exists() { return 1; }
+        begin_node_transaction() {
+            ACTIVE_NODE_BACKUP="$TEST_TMP/password-failure-transaction"
+            mkdir -p "$ACTIVE_NODE_BACKUP"
+        }
         install_singbox_if_missing() { return 0; }
+        configured_node_ports_csv() { return 0; }
         prompt_node_host() { printf -v "$1" '%s' node.example.com; }
         default_name_for_host() { printf '%s\n' ss-node; }
         sanitize_paste_input() { printf '%s\n' "$1"; }
@@ -219,7 +216,7 @@ test_ss_password_generation_failure_rolls_back_before_mutation() {
         fi
         assert_file_contains "$TEST_TMP/password-failure.rollback" '^rolled-back$'
         assert_empty_file "$event_log" "密码生成失败后不得修改防火墙或节点文件"
-        assert_file_contains "$TEST_TMP/password-failure.out" '随机强密码生成失败，未创建新节点。'
+        assert_file_contains "$TEST_TMP/password-failure.out" '随机强密码生成失败，未创建 Shadowsocks 节点。'
     )
 }
 
@@ -254,8 +251,7 @@ test_view_node_propagates_uri_failure() {
     (
         require_valid_node_state_if_present() { return 0; }
         node_exists() { return 0; }
-        load_state() { return 0; }
-        write_uri_file() { return 1; }
+        write_uri_files() { return 1; }
 
         if view_node_link >/dev/null 2>&1; then
             fail "节点链接写入失败时查看功能不应成功"
@@ -267,37 +263,40 @@ test_node_state_writes_are_atomic() {
     (
         local old_state="$TEST_TMP/state-atomic/old"
         CONFIG_DIR="$TEST_TMP/state-atomic/config"
-        STATE_FILE="$CONFIG_DIR/vpsbox.env"
+        SS_STATE_FILE="$CONFIG_DIR/vpsbox-ss.env"
+        VLESS_STATE_FILE="$CONFIG_DIR/vpsbox-vless.env"
         mkdir -p "$CONFIG_DIR"
-        printf '%s\n' keep-old > "$STATE_FILE"
+        printf '%s\n' keep-old > "$SS_STATE_FILE"
         secure_config_dir() { return 0; }
         printf() {
             [ "${1:-}" != 'NAME=%s\n' ] || return 42
             builtin printf "$@"
         }
 
-        if save_state example.com node 12345 secret; then
+        if save_state example.com node 12345 secret 111111111111111111111111; then
             unset -f printf
             fail "SS 状态中途写入失败时不应报告成功"
         fi
         unset -f printf
-        cp "$STATE_FILE" "$old_state"
+        cp "$SS_STATE_FILE" "$old_state"
         assert_file_contains "$old_state" '^keep-old$' "SS 写入失败不得截断旧状态"
-        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.vpsbox-state.*' -print -quit)" ] ||
+        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.vpsbox-ss-state.*' -print -quit)" ] ||
             fail "SS 写入失败后残留临时状态文件"
 
-        printf '%s\n' keep-vless > "$STATE_FILE"
+        printf '%s\n' keep-vless > "$VLESS_STATE_FILE"
         printf() {
             [ "${1:-}" != 'UUID=%s\n' ] || return 42
             builtin printf "$@"
         }
-        if save_vless_reality_state example.com node 12345 uuid sni key abcdef0123456789; then
+        if save_vless_reality_state \
+            example.com node 12345 uuid sni private key abcdef0123456789 \
+            222222222222222222222222; then
             unset -f printf
             fail "VLESS 状态中途写入失败时不应报告成功"
         fi
         unset -f printf
-        assert_file_contains "$STATE_FILE" '^keep-vless$' "VLESS 写入失败不得截断旧状态"
-        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.vpsbox-state.*' -print -quit)" ] ||
+        assert_file_contains "$VLESS_STATE_FILE" '^keep-vless$' "VLESS 写入失败不得截断旧状态"
+        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.vpsbox-vless-state.*' -print -quit)" ] ||
             fail "VLESS 写入失败后残留临时状态文件"
     )
 }
@@ -332,25 +331,40 @@ test_singbox_summary_line_states() {
     )
 }
 
-test_node_summary_compacts_absent_state() {
+test_node_summary_orders_only_existing_protocols() {
     (
-        local mock_node_exists=0
-        node_exists() {
-            [ "$mock_node_exists" -eq 1 ] || return 1
-            # These globals are consumed dynamically by node_summary.
-            # shellcheck disable=SC2034,SC2100
-            PROTOCOL=vless-reality NAME=test-node DOMAIN=example.com PORT=30000
+        local mock_vless=0 mock_ss=0
+        node_artifacts_present() { return 1; }
+        load_protocol_state() {
+            case "$1" in
+                vless)
+                    [ "$mock_vless" -eq 1 ] || return 1
+                    NAME=vless-node DOMAIN=vless.example.com PORT=30000
+                    ;;
+                ss)
+                    [ "$mock_ss" -eq 1 ] || return 1
+                    NAME=ss-node DOMAIN=ss.example.com PORT=30001
+                    ;;
+            esac
+            : "$NAME" "$DOMAIN" "$PORT"
         }
 
-        assert_eq " 当前节点：未创建" "$(node_summary)" \
-            "无节点时不应显示四行无意义占位符"
-        mock_node_exists=1
-        assert_eq " 当前节点：已创建
- 节点协议：VLESS Reality
- 节点名称：test-node
- 节点地址：example.com
- 节点端口：30000" "$(node_summary)" \
-            "已有节点时应保留完整五行信息"
+        assert_eq "" "$(node_summary)" "未创建的协议不应显示状态区块"
+        mock_vless=1
+        mock_ss=1
+        assert_eq "----------------------------------------
+ VLESS Reality 节点
+ 状态：已创建
+ 名称：vless-node
+ 地址：vless.example.com
+ 端口：30000
+----------------------------------------
+ Shadowsocks 节点
+ 状态：已创建
+ 名称：ss-node
+ 地址：ss.example.com
+ 端口：30001" "$(node_summary)" \
+            "VLESS 应显示在 Shadowsocks 上方，且 Shadowsocks 名称不带 2022"
     )
 }
 
@@ -370,11 +384,12 @@ test_bbr_fq_summary_preserves_partial_state() {
 test_main_and_system_menu_presentation() {
     (
         local main_output="$TEST_TMP/main-menu.out"
+        local node_output="$TEST_TMP/node-menu.out"
         local system_output="$TEST_TMP/system-menu.out"
         clear() { :; }
         vpsbox_update_notice() { return 0; }
         singbox_summary_line() { printf ' sing-box：未安装\n'; }
-        node_summary() { printf ' 当前节点：未创建\n'; }
+        node_summary() { return 0; }
         ipv4_dns_lines() { printf ' nameserver 1.1.1.1\n'; }
 
         show_menu > "$main_output"
@@ -383,6 +398,13 @@ test_main_and_system_menu_presentation() {
         assert_file_contains "$main_output" '^ \[7\] 第三方脚本$'
         assert_file_contains "$main_output" '^ \[00\] 更新 vpsbox$'
         assert_file_not_contains "$main_output" '一键自检|查看三网回程|其他脚本|更新 vpsbox 脚本'
+
+        node_menu <<< "0" > "$node_output"
+        assert_file_contains "$node_output" '^ \[1\] 创建/重建 VLESS Reality 节点（推荐）$'
+        assert_file_contains "$node_output" '^ \[2\] 创建/重建 Shadowsocks 节点$'
+        assert_file_contains "$node_output" '^ \[4\] 删除 VLESS Reality 节点$'
+        assert_file_contains "$node_output" '^ \[5\] 删除 Shadowsocks 节点$'
+        assert_file_not_contains "$node_output" 'SS 2022|删除当前节点'
 
         detect_os() {
             # OS is consumed dynamically by system_menu.
@@ -538,15 +560,13 @@ test_protocol_specific_listener_checks() {
         if port_listener_ready 43333 both; then
             fail "SS 只有 TCP、缺少 UDP 时不得通过监听检查"
         fi
-        if port_conflicts_with_existing_node 43333 both tcp; then
-            fail "VLESS 切换到 SS 时，旧节点占用的 TCP 不应被误判为外部冲突"
+        if port_conflicts_with_existing_node 43333 tcp tcp; then
+            fail "重建 VLESS 时，原节点占用的 TCP 不应被误判为外部冲突"
         fi
         udp_ready=1
         port_listener_ready 43333 both || fail "SS 的 TCP 与 UDP 都监听时应通过"
-        port_conflicts_with_existing_node 43333 both tcp ||
-            fail "VLESS 切换到 SS 时应识别额外的 UDP 端口冲突"
-        if port_conflicts_with_existing_node 43333 tcp both; then
-            fail "SS 切换到 VLESS 时，旧节点已有的 TCP 监听可以复用"
+        if port_conflicts_with_existing_node 43333 both both; then
+            fail "重建 Shadowsocks 时，原节点占用的 TCP/UDP 不应被误判为外部冲突"
         fi
     )
 }
@@ -735,7 +755,7 @@ main() {
         test_node_host_rejected_detection_falls_back_to_manual_input
         test_node_host_warns_for_possible_nat
         test_uri_write_preserves_existing_on_failure
-        test_node_eof_rolls_back_fresh_install_config
+        test_node_eof_has_no_mutation
         test_interactive_confirm_is_function_local
         test_ss_password_generation_failure_rolls_back_before_mutation
         test_reality_checks_require_bounded_dns_and_openssl
@@ -743,7 +763,7 @@ main() {
         test_node_state_writes_are_atomic
         test_service_running_requires_exact_config_process
         test_singbox_summary_line_states
-        test_node_summary_compacts_absent_state
+        test_node_summary_orders_only_existing_protocols
         test_bbr_fq_summary_preserves_partial_state
         test_main_and_system_menu_presentation
         test_third_party_menu_keeps_authors
