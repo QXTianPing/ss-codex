@@ -328,6 +328,33 @@ test_vpsbox_reexec_failure_restores_previous() {
     assert_file_contains "$output" '已从 .*previous 恢复旧版 vpsbox'
 }
 
+test_vpsbox_alias_failure_restores_previous_without_reexec() {
+    local output
+    reset_update_case alias-failure
+    output="$TEST_TMP/alias-failure.out"
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" current
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" newer
+    install_command_alias() {
+        printf '%s\n' alias-failed >> "$MOCK_EVENT_LOG"
+        return 1
+    }
+    restore_previous_vpsbox() {
+        printf 'restore:%s\n' "$1" >> "$MOCK_EVENT_LOG"
+        cp "$1" "$CMD_PATH"
+    }
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail "管理命令入口安装失败时更新不应成功"
+    fi
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$MOCK_EVENT_LOG" '^alias-failed$'
+    assert_file_contains "$MOCK_EVENT_LOG" '^restore:'
+    assert_file_not_contains "$MOCK_EVENT_LOG" '^reexec:'
+    assert_file_not_contains "$MOCK_EVENT_LOG" '^cleanup-lock$'
+    assert_file_contains "$output" '管理命令入口安装失败'
+    assert_file_contains "$output" '已恢复更新前的 vpsbox 脚本。'
+}
+
 test_pending_update_startup_failure_restores_previous() {
     local status
 
@@ -546,6 +573,7 @@ main() {
         test_vpsbox_invalid_download_preserves_current
         test_vpsbox_wrong_project_preserves_current
         test_vpsbox_reexec_failure_restores_previous
+        test_vpsbox_alias_failure_restores_previous_without_reexec
         test_pending_update_startup_failure_restores_previous
         test_top_level_startup_failure_restores_previous
         test_pending_update_confirmation_prevents_rollback

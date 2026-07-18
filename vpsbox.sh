@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.31"
+VPSBOX_VERSION="v1.0.32"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -2921,7 +2921,7 @@ setup_service() {
 }
 
 create_or_rebuild_node() {
-    local backup_dir
+    local backup_dir confirm
     local existing_port="" existing_protocols=""
     require_valid_node_state_if_present || return 1
     backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
@@ -3008,7 +3008,11 @@ EOF
         return 0
     fi
     info "正在自动生成随机强密码..."
-    password="$(random_password)"
+    if ! password="$(random_password)" || [ -z "$password" ]; then
+        rollback_node_files_transaction || true
+        err "随机强密码生成失败，未创建新节点。"
+        return 1
+    fi
 
     info "加密方式：$METHOD"
     info "正在写入配置..."
@@ -3284,7 +3288,7 @@ EOF
 }
 
 delete_node() {
-    local node_port node_protocols backup_dir
+    local node_port node_protocols backup_dir confirm
 
     require_valid_node_state_if_present || return 1
     if ! node_exists; then
@@ -3791,7 +3795,15 @@ update_vpsbox() {
         [ ! -f "$backup" ] || restore_previous_vpsbox "$backup" || true
         return 1
     fi
-    install_command_alias
+    if ! install_command_alias; then
+        err "新版 vpsbox 管理命令入口安装失败，正在恢复旧版脚本。"
+        if [ -f "$backup" ] && restore_previous_vpsbox "$backup"; then
+            warn "已恢复更新前的 vpsbox 脚本。"
+        else
+            err "自动恢复失败；请使用备份手动恢复：$backup"
+        fi
+        return 1
+    fi
 
     info "vpsbox 已更新；旧版本备份：$backup"
     info "正在重新打开新版管理面板..."
@@ -10476,7 +10488,7 @@ nexttrace_installed() {
 }
 
 ensure_nexttrace() {
-    local arch asset tmp
+    local arch asset tmp confirm
 
     if nexttrace_installed; then
         return 0

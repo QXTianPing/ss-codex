@@ -144,6 +144,85 @@ test_node_eof_rolls_back_fresh_install_config() {
     done
 }
 
+test_interactive_confirm_is_function_local() {
+    (
+        confirm=sentinel
+        PORT=20000
+        PROTOCOL=shadowsocks
+        require_valid_node_state_if_present() { return 0; }
+        backup_node_files() { mkdir -p "$1"; }
+        cleanup_node_backup() { rm -rf -- "$1"; }
+        node_exists() { return 0; }
+
+        create_or_rebuild_node <<< n >"$TEST_TMP/create-confirm.out" 2>&1 ||
+            fail "取消覆盖节点应正常返回"
+        assert_eq sentinel "$confirm" "创建节点确认不得覆盖同名全局变量"
+    )
+
+    (
+        confirm=sentinel
+        require_valid_node_state_if_present() { return 0; }
+        node_exists() { return 0; }
+        load_state() {
+            PORT=20000
+            PROTOCOL=shadowsocks
+        }
+
+        delete_node <<< n >"$TEST_TMP/delete-confirm.out" 2>&1 ||
+            fail "取消删除节点应正常返回"
+        assert_eq sentinel "$confirm" "删除节点确认不得覆盖同名全局变量"
+    )
+
+    (
+        confirm=sentinel
+        nexttrace_installed() { return 1; }
+
+        if ensure_nexttrace <<< n >"$TEST_TMP/nexttrace-confirm.out" 2>&1; then
+            fail "取消安装 nexttrace 应返回失败"
+        fi
+        assert_eq sentinel "$confirm" "nexttrace 安装确认不得覆盖同名全局变量"
+    )
+}
+
+test_ss_password_generation_failure_rolls_back_before_mutation() {
+    (
+        local event_log="$TEST_TMP/password-failure-events"
+        CONFIG_DIR="$TEST_TMP/password-failure-config"
+        CONFIG_PATH="$CONFIG_DIR/config.json"
+        URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
+        ACTIVE_NODE_BACKUP=""
+        : > "$event_log"
+
+        require_valid_node_state_if_present() { return 0; }
+        node_exists() { return 1; }
+        backup_node_files() { mkdir -p "$1"; }
+        install_singbox_if_missing() { return 0; }
+        prompt_node_host() { printf -v "$1" '%s' node.example.com; }
+        default_name_for_host() { printf '%s\n' ss-node; }
+        sanitize_paste_input() { printf '%s\n' "$1"; }
+        sanitize_name() { printf '%s\n' "$1"; }
+        choose_node_port() { printf '%s\n' 20000; }
+        confirm_default_yes() { return 0; }
+        random_password() { return 1; }
+        rollback_node_files_transaction() {
+            local backup="${ACTIVE_NODE_BACKUP:-}"
+            ACTIVE_NODE_BACKUP=""
+            rm -rf -- "$backup"
+            printf '%s\n' rolled-back > "$TEST_TMP/password-failure.rollback"
+        }
+        firewall_prepare_port_transition() { printf '%s\n' firewall >> "$event_log"; }
+        write_config() { printf '%s\n' config >> "$event_log"; }
+        save_state() { printf '%s\n' state >> "$event_log"; }
+
+        if create_or_rebuild_node <<< '' >"$TEST_TMP/password-failure.out" 2>&1; then
+            fail "密码生成失败时节点创建不应成功"
+        fi
+        assert_file_contains "$TEST_TMP/password-failure.rollback" '^rolled-back$'
+        assert_empty_file "$event_log" "密码生成失败后不得修改防火墙或节点文件"
+        assert_file_contains "$TEST_TMP/password-failure.out" '随机强密码生成失败，未创建新节点。'
+    )
+}
+
 test_reality_checks_require_bounded_dns_and_openssl() {
     (
         local log="$TEST_TMP/dns-bounded.log"
@@ -657,6 +736,8 @@ main() {
         test_node_host_warns_for_possible_nat
         test_uri_write_preserves_existing_on_failure
         test_node_eof_rolls_back_fresh_install_config
+        test_interactive_confirm_is_function_local
+        test_ss_password_generation_failure_rolls_back_before_mutation
         test_reality_checks_require_bounded_dns_and_openssl
         test_view_node_propagates_uri_failure
         test_node_state_writes_are_atomic
