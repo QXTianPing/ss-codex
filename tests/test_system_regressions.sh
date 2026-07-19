@@ -82,6 +82,25 @@ test_restore_replaces_target_symlink() {
     assert_file_contains "$victim" '^victim$' "不得覆盖符号链接指向的文件"
 }
 
+test_atomic_snapshot_restore_replaces_target_symlink() {
+    local source target victim
+
+    source="$TEST_TMP/atomic-restore/source"
+    target="$TEST_TMP/atomic-restore/target"
+    victim="$TEST_TMP/atomic-restore/victim"
+    mkdir -p "$(dirname "$source")"
+    printf 'snapshot\n' > "$source"
+    printf 'victim\n' > "$victim"
+    ln -s "$victim" "$target"
+
+    restore_file_atomically_from_snapshot "$source" "$target"
+
+    [ -f "$target" ] && [ ! -L "$target" ] ||
+        fail "原子恢复后目标应为普通文件"
+    assert_file_contains "$target" '^snapshot$'
+    assert_file_contains "$victim" '^victim$' "不得写入原符号链接指向的文件"
+}
+
 test_debian_update_stops_after_first_failure() {
     local log="$TEST_TMP/debian-update.log"
 
@@ -850,6 +869,7 @@ main() {
         test_manifest_round_trips_ssh_port_csv
         test_clear_change_tracking_reports_partial_failure
         test_restore_replaces_target_symlink
+        test_atomic_snapshot_restore_replaces_target_symlink
         test_debian_update_stops_after_first_failure
         test_debian_update_uses_upgrade_timeout
         test_debian_upgrade_failure_skips_autoremove

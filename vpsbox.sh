@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.35"
+VPSBOX_VERSION="v1.0.36"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -1009,6 +1009,34 @@ install_root_file_atomically() {
     fi
 }
 
+restore_file_atomically_from_snapshot() {
+    local snapshot="$1" target="$2" parent tmp
+
+    [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    if [ -e "$target" ] && [ ! -f "$target" ] && [ ! -L "$target" ]; then
+        return 1
+    fi
+    parent="$(dirname "$target")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    command -v mktemp >/dev/null 2>&1 || return 1
+    tmp="$(mktemp "$parent/.vpsbox-restore.XXXXXX")" || return 1
+    # 在目标目录中准备副本再 rename，恢复过程中不会把目标文件直接截断。
+    if ! cp -a -- "$snapshot" "$tmp" ||
+        ! mv -f -- "$tmp" "$target"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+remove_snapshot_target_file() {
+    local target="$1"
+
+    if [ -e "$target" ] && [ ! -f "$target" ] && [ ! -L "$target" ]; then
+        return 1
+    fi
+    rm -f -- "$target"
+}
+
 restore_root_file_snapshot() {
     local snapshot="$1" target="$2" was_present="$3"
     local mode
@@ -1022,7 +1050,7 @@ restore_root_file_snapshot() {
         if [ -e "$target" ] && [ ! -f "$target" ]; then
             return 1
         fi
-        rm -f -- "$target"
+        remove_snapshot_target_file "$target"
     fi
 }
 
@@ -1538,7 +1566,7 @@ change_needs_restore() {
 }
 
 restore_change_file() {
-    local name="$1" target="$2" state backup tmp parent
+    local name="$1" target="$2" state backup
     state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
     case "$state" in
         file)
@@ -1547,24 +1575,7 @@ restore_change_file() {
                 err "$name 的备份文件无效，已拒绝恢复。"
                 return 1
             }
-            parent="$(dirname "$target")"
-            [ -d "$parent" ] && [ ! -L "$parent" ] || {
-                err "恢复目标目录无效或为符号链接：$parent"
-                return 1
-            }
-            tmp="$(mktemp "$parent/.vpsbox-restore.XXXXXX")" || return 1
-            if ! cp -a "$backup" "$tmp"; then
-                rm -f -- "$tmp"
-                return 1
-            fi
-            # 目标后来可能被系统组件改成符号链接；删除链接本身，避免覆盖其指向文件。
-            if [ -L "$target" ] && ! rm -f -- "$target"; then
-                rm -f -- "$tmp"
-                return 1
-            fi
-            if { [ -e "$target" ] && [ ! -f "$target" ]; } ||
-                ! mv -f -- "$tmp" "$target"; then
-                rm -f -- "$tmp"
+            if ! restore_file_atomically_from_snapshot "$backup" "$target"; then
                 return 1
             fi
             ;;
@@ -2862,10 +2873,11 @@ restore_uri_file_group() {
     local dest backup
 
     for dest in "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
-        rm -f -- "$dest" || return 1
         backup="$backup_dir/${dest##*/}"
         if [ -f "$backup" ]; then
-            cp -a -- "$backup" "$dest" || return 1
+            restore_file_atomically_from_snapshot "$backup" "$dest" || return 1
+        else
+            remove_snapshot_target_file "$dest" || return 1
         fi
     done
 }
@@ -3351,6 +3363,46 @@ commit_node_transaction() {
     }
 }
 
+restore_node_file_from_backup() {
+    local backup_dir="$1" entry="$2" snapshot="$3" target="$4" status
+
+    if node_backup_entry_is_present "$backup_dir/manifest" "$entry"; then
+        restore_file_atomically_from_snapshot "$snapshot" "$target"
+        return $?
+    fi
+    status=$?
+    [ "$status" -eq 1 ] || return 1
+    remove_snapshot_target_file "$target"
+}
+
+restore_node_config_dir_from_backup() {
+    local backup_dir="$1" status
+
+    if [ -e "$NODE_CONFIG_DIR" ] && ! node_config_dir_contents_valid; then
+        err "当前节点配置目录不安全或包含未知文件，已拒绝覆盖：$NODE_CONFIG_DIR"
+        return 1
+    fi
+    if node_backup_entry_is_present "$backup_dir/manifest" vpsbox.d; then
+        if [ ! -e "$NODE_CONFIG_DIR" ]; then
+            install -d -o root -g root -m 700 "$NODE_CONFIG_DIR" || return 1
+        fi
+        node_dir_is_secure "$NODE_CONFIG_DIR" || return 1
+        restore_node_file_from_backup "$backup_dir" "vpsbox.d/${SS_CONFIG_PATH##*/}" \
+            "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" "$SS_CONFIG_PATH" || return 1
+        restore_node_file_from_backup "$backup_dir" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
+            "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$VLESS_CONFIG_PATH" || return 1
+        node_config_dir_contents_valid
+        return $?
+    fi
+    status=$?
+    [ "$status" -eq 1 ] || return 1
+    restore_node_file_from_backup "$backup_dir" "vpsbox.d/${SS_CONFIG_PATH##*/}" \
+        "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" "$SS_CONFIG_PATH" || return 1
+    restore_node_file_from_backup "$backup_dir" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
+        "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$VLESS_CONFIG_PATH" || return 1
+    [ ! -e "$NODE_CONFIG_DIR" ] || rmdir -- "$NODE_CONFIG_DIR"
+}
+
 restore_node_files() {
     local backup_dir="$1"
     local was_running="0"
@@ -3375,34 +3427,36 @@ restore_node_files() {
     fi
 
     [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] || {
-        err "节点配置目录异常，已拒绝递归恢复：$NODE_CONFIG_DIR"
+        err "节点配置目录异常，已拒绝恢复：$NODE_CONFIG_DIR"
         return 1
     }
-    rm -rf -- "$NODE_CONFIG_DIR" || failed=1
-    rm -f "$URI_FILE" \
-        "$SS_STATE_FILE" "$VLESS_STATE_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE" || failed=1
-    if [ -f "$backup_dir/node-uri.txt" ]; then cp -a "$backup_dir/node-uri.txt" "$URI_FILE" || failed=1; fi
-    if [ -d "$backup_dir/vpsbox.d" ]; then cp -a "$backup_dir/vpsbox.d" "$NODE_CONFIG_DIR" || failed=1; fi
-    if [ -f "$backup_dir/ss-state.env" ]; then cp -a "$backup_dir/ss-state.env" "$SS_STATE_FILE" || failed=1; fi
-    if [ -f "$backup_dir/vless-state.env" ]; then cp -a "$backup_dir/vless-state.env" "$VLESS_STATE_FILE" || failed=1; fi
-    if [ -f "$backup_dir/ss-uri.txt" ]; then cp -a "$backup_dir/ss-uri.txt" "$SS_URI_FILE" || failed=1; fi
-    if [ -f "$backup_dir/vless-uri.txt" ]; then cp -a "$backup_dir/vless-uri.txt" "$VLESS_URI_FILE" || failed=1; fi
+    restore_node_config_dir_from_backup "$backup_dir" || failed=1
+    restore_node_file_from_backup "$backup_dir" node-uri.txt "$backup_dir/node-uri.txt" "$URI_FILE" || failed=1
+    restore_node_file_from_backup "$backup_dir" ss-state.env "$backup_dir/ss-state.env" "$SS_STATE_FILE" || failed=1
+    restore_node_file_from_backup "$backup_dir" vless-state.env "$backup_dir/vless-state.env" "$VLESS_STATE_FILE" || failed=1
+    restore_node_file_from_backup "$backup_dir" ss-uri.txt "$backup_dir/ss-uri.txt" "$SS_URI_FILE" || failed=1
+    restore_node_file_from_backup "$backup_dir" vless-uri.txt "$backup_dir/vless-uri.txt" "$VLESS_URI_FILE" || failed=1
+
+    # 文件未完整恢复前保持服务停止，避免用混合的新旧配置重新拉起 sing-box。
+    if [ "$failed" -ne 0 ]; then
+        err "操作前的节点文件恢复不完整，备份已保留：$backup_dir"
+        return 1
+    fi
 
     if is_systemd; then
-        if [ -f "$backup_dir/sing-box.service" ]; then
-            cp -a "$backup_dir/sing-box.service" /etc/systemd/system/sing-box.service || failed=1
-        else
-            rm -f /etc/systemd/system/sing-box.service || failed=1
-        fi
+        restore_node_file_from_backup "$backup_dir" sing-box.service \
+            "$backup_dir/sing-box.service" /etc/systemd/system/sing-box.service || failed=1
         systemctl daemon-reload 2>/dev/null || failed=1
     fi
 
     if [ "$OS" = "alpine" ]; then
-        if [ -f "$backup_dir/openrc-sing-box" ]; then
-            cp -a "$backup_dir/openrc-sing-box" /etc/init.d/sing-box || failed=1
-        else
-            rm -f /etc/init.d/sing-box || failed=1
-        fi
+        restore_node_file_from_backup "$backup_dir" openrc-sing-box \
+            "$backup_dir/openrc-sing-box" /etc/init.d/sing-box || failed=1
+    fi
+
+    if [ "$failed" -ne 0 ]; then
+        err "操作前的节点服务文件恢复不完整，备份已保留：$backup_dir"
+        return 1
     fi
 
     restore_singbox_service_state "$was_enabled" "$was_running" 2>/dev/null || failed=1
@@ -6447,18 +6501,9 @@ restore_ntp_snapshot_file() {
 
     if [ -f "$snapshot_dir/$name.present" ]; then
         [ -f "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ] || return 1
-        if [ -L "$target" ]; then
-            rm -f -- "$target" || return 1
-        elif [ -e "$target" ] && [ ! -f "$target" ]; then
-            return 1
-        fi
-        cp -a "$snapshot_dir/$name" "$target"
+        restore_file_atomically_from_snapshot "$snapshot_dir/$name" "$target"
     elif [ -f "$snapshot_dir/$name.absent" ]; then
-        if [ -L "$target" ] || [ -f "$target" ]; then
-            rm -f -- "$target"
-        elif [ -e "$target" ]; then
-            return 1
-        fi
+        remove_snapshot_target_file "$target"
     else
         return 1
     fi
@@ -6975,9 +7020,11 @@ write_resolv_conf_dns() {
         else
             err "DNS 解析验证失败，正在恢复原配置。"
             if [ -e "$backup" ]; then
-                cp -a "$backup" "$RESOLV_CONF" || warn "恢复 DNS 备份失败：$backup"
+                restore_file_atomically_from_snapshot "$backup" "$RESOLV_CONF" ||
+                    warn "恢复 DNS 备份失败：$backup"
             elif [ "$created_resolv" = "1" ]; then
-                rm -f "$RESOLV_CONF"
+                remove_snapshot_target_file "$RESOLV_CONF" ||
+                    warn "删除新建 DNS 配置失败：$RESOLV_CONF"
             fi
             return 1
         fi
@@ -6996,14 +7043,17 @@ rollback_systemd_resolved_dns() {
     local created_conf="$3"
 
     if [ -n "$backup" ] && [ -e "$backup" ]; then
-        if cp "$backup" "$conf_file" 2>/dev/null; then
+        if restore_file_atomically_from_snapshot "$backup" "$conf_file"; then
             warn "已恢复 systemd-resolved DNS 备份：$backup"
         else
             warn "恢复 systemd-resolved DNS 备份失败，请手动检查：$backup"
         fi
     elif [ "$created_conf" = "1" ]; then
-        rm -f "$conf_file"
-        warn "已删除新建的 systemd-resolved DNS 配置：$conf_file"
+        if remove_snapshot_target_file "$conf_file"; then
+            warn "已删除新建的 systemd-resolved DNS 配置：$conf_file"
+        else
+            warn "删除新建的 systemd-resolved DNS 配置失败，请手动检查：$conf_file"
+        fi
     else
         warn "未找到可恢复的 systemd-resolved DNS 备份，请手动检查：$conf_file"
     fi
@@ -11038,8 +11088,22 @@ restore_file() {
     name="\$1"
     target="\$2"
     if [ -e "\$dir/\$name.present" ]; then
-        cp -a "\$dir/\$name" "\$target" || return 1
+        source="\$dir/\$name"
+        [ -f "\$source" ] && [ ! -L "\$source" ] || return 1
+        if [ -e "\$target" ] && [ ! -f "\$target" ] && [ ! -L "\$target" ]; then
+            return 1
+        fi
+        parent="\$(dirname "\$target")"
+        [ -d "\$parent" ] && [ ! -L "\$parent" ] || return 1
+        tmp="\$(mktemp "\$parent/.vpsbox-firewall-restore.XXXXXX")" || return 1
+        if ! cp -a "\$source" "\$tmp" || ! mv -f "\$tmp" "\$target"; then
+            rm -f "\$tmp"
+            return 1
+        fi
     else
+        if [ -e "\$target" ] && [ ! -f "\$target" ] && [ ! -L "\$target" ]; then
+            return 1
+        fi
         rm -f "\$target" || return 1
     fi
 }
@@ -13467,21 +13531,13 @@ create_hostname_operation_snapshot() {
 }
 
 restore_hostname_snapshot_file() {
-    local dir="$1" name="$2" target="$3" parent tmp
+    local dir="$1" name="$2" target="$3"
 
     if [ -e "$dir/$name.present" ]; then
         [ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || return 1
-        parent="$(dirname "$target")"
-        [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
-        tmp="$(mktemp "$parent/.vpsbox-hostname-restore.XXXXXX")" || return 1
-        if ! cp -a -- "$dir/$name" "$tmp" ||
-            { [ -L "$target" ] && ! rm -f -- "$target"; } ||
-            ! mv -f -- "$tmp" "$target"; then
-            rm -f -- "$tmp"
-            return 1
-        fi
+        restore_file_atomically_from_snapshot "$dir/$name" "$target"
     elif [ -e "$dir/$name.absent" ]; then
-        rm -f -- "$target"
+        remove_snapshot_target_file "$target"
     else
         return 1
     fi

@@ -184,6 +184,10 @@ test_restore_lock_metadata_is_atomically_published() {
         'owner_tmp="\$dir/[.]restore[.]lock[.]owner[.]\$\$"'
     assert_file_contains "$snapshot/rollback.sh" \
         'mv -f "\$owner_tmp" "\$lock_dir/owner"'
+    assert_file_contains "$snapshot/rollback.sh" \
+        'mktemp "\$parent/[.]vpsbox-firewall-restore[.]XXXXXX"'
+    assert_file_contains "$snapshot/rollback.sh" \
+        'mv -f "\$tmp" "\$target"'
     assert_file_not_contains "$snapshot/rollback.sh" \
         '> "\$lock_dir/pid"'
 }
