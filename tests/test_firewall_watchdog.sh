@@ -158,6 +158,36 @@ test_immediate_restore_stops_timed_watchdog() {
     trap - EXIT
 }
 
+test_stale_restore_lock_is_reclaimed() {
+    local snapshot=""
+
+    reset_firewall_case stale-restore-lock
+    firewall_create_rollback_snapshot snapshot ""
+    mkdir "$snapshot/restore.lock"
+    printf '%s\n' 999999 > "$snapshot/restore.lock/pid"
+    printf '%s\n' 1 > "$snapshot/restore.lock/start"
+    cat /proc/sys/kernel/random/boot_id > "$snapshot/restore.lock/boot"
+
+    firewall_restore_snapshot_now "$snapshot" 0
+
+    [ ! -e "$snapshot" ] ||
+        fail "SIGKILL 遗留的 restore.lock 不应永久阻塞快照恢复"
+}
+
+test_restore_lock_metadata_is_atomically_published() {
+    local snapshot=""
+
+    reset_firewall_case atomic-restore-lock
+    firewall_create_rollback_snapshot snapshot ""
+
+    assert_file_contains "$snapshot/rollback.sh" \
+        'owner_tmp="\$dir/[.]restore[.]lock[.]owner[.]\$\$"'
+    assert_file_contains "$snapshot/rollback.sh" \
+        'mv -f "\$owner_tmp" "\$lock_dir/owner"'
+    assert_file_not_contains "$snapshot/rollback.sh" \
+        '> "\$lock_dir/pid"'
+}
+
 test_identity_mismatch_is_cleaned_without_kill() {
     local dir pid start boot
 
@@ -298,6 +328,8 @@ main() {
     local -a tests=(
         test_commit_stops_watchdog_and_sleep
         test_immediate_restore_stops_timed_watchdog
+        test_stale_restore_lock_is_reclaimed
+        test_restore_lock_metadata_is_atomically_published
         test_identity_mismatch_is_cleaned_without_kill
         test_pid_only_partial_watchdog_is_stopped
         test_partial_dead_metadata_is_cleaned

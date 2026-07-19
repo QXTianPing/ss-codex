@@ -192,6 +192,7 @@ test_ss_password_generation_failure_rolls_back_before_mutation() {
             ACTIVE_NODE_BACKUP="$TEST_TMP/password-failure-transaction"
             mkdir -p "$ACTIVE_NODE_BACKUP"
         }
+        singbox_installed() { return 0; }
         install_singbox_if_missing() { return 0; }
         configured_node_ports_csv() { return 0; }
         prompt_node_host() { printf -v "$1" '%s' node.example.com; }
@@ -217,6 +218,89 @@ test_ss_password_generation_failure_rolls_back_before_mutation() {
         assert_file_contains "$TEST_TMP/password-failure.rollback" '^rolled-back$'
         assert_empty_file "$event_log" "密码生成失败后不得修改防火墙或节点文件"
         assert_file_contains "$TEST_TMP/password-failure.out" '随机强密码生成失败，未创建 Shadowsocks 节点。'
+    )
+}
+
+test_first_singbox_install_marks_transaction_before_install() {
+    (
+        local log="$TEST_TMP/node-first-install.log"
+        : > "$log"
+        singbox_installed() { return 1; }
+        mark_node_transaction_mutated() { printf '%s\n' mark >> "$log"; }
+        install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+
+        install_singbox_for_node_transaction
+        assert_eq $'mark\ninstall' "$(cat "$log")" \
+            "首次安装 sing-box 前必须先持久化节点事务修改标记"
+    )
+
+    (
+        local log="$TEST_TMP/node-first-install-mark-failure.log"
+        : > "$log"
+        singbox_installed() { return 1; }
+        mark_node_transaction_mutated() { return 23; }
+        install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+
+        if install_singbox_for_node_transaction; then
+            fail "节点事务修改标记失败后不得继续安装 sing-box"
+        fi
+        assert_empty_file "$log"
+    )
+}
+
+test_atomic_root_publish_preserves_existing_target() {
+    (
+        local dir="$TEST_TMP/root-atomic-publish"
+        mkdir -p "$dir"
+        printf '%s\n' old > "$dir/target"
+        printf '%s\n' new > "$dir/source"
+        chown() { return 0; }
+        mv() { return 1; }
+
+        if install_root_file_atomically "$dir/source" "$dir/target" 755; then
+            fail "原子发布替换失败时不应报告成功"
+        fi
+        assert_file_contains "$dir/target" '^old$'
+        if find "$dir" -maxdepth 1 -name '.vpsbox-publish.*' -print -quit | grep -q .; then
+            fail "原子发布失败后不应遗留临时文件"
+        fi
+    )
+}
+
+test_runtime_dir_permission_failure_is_fatal() {
+    (
+        RUNTIME_DIR="$TEST_TMP/runtime-permission-failure"
+        chown() { return 23; }
+
+        if (prepare_runtime_dir) >"$TEST_TMP/runtime-permission.out" 2>&1; then
+            fail "运行目录权限无法保护时不得继续"
+        fi
+        assert_file_contains "$TEST_TMP/runtime-permission.out" '无法保护运行目录'
+    )
+}
+
+test_lockdir_first_acquisition_uses_reclaim_guard() {
+    (
+        local log="$TEST_TMP/lock-first-guard.log"
+        RUNTIME_DIR="$TEST_TMP/lock-first-guard"
+        LOCK_DIR="$RUNTIME_DIR/menu.lock.d"
+        : > "$log"
+        prepare_runtime_dir() { mkdir -p "$RUNTIME_DIR"; }
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = flock ]; then
+                return 1
+            fi
+            builtin command "$@"
+        }
+        acquire_lockdir_reclaim_guard() { printf '%s\n' guard >> "$log"; }
+        release_lockdir_reclaim_guard() { printf '%s\n' release >> "$log"; }
+        activate_lockdir_lock() {
+            assert_file_contains "$log" '^guard$' \
+                "首次创建无 flock 锁目录前必须先取得回收保护"
+        }
+
+        acquire_lock
+        assert_eq $'guard\nrelease' "$(cat "$log")"
     )
 }
 
@@ -673,8 +757,12 @@ test_failed_singbox_update_restores_binary_and_state() {
         local fake_bin="$TEST_TMP/singbox-bin"
         local output="$TEST_TMP/singbox-update.out"
         local update_backup="$TEST_TMP/singbox-update-backup"
+        VPSBOX_STATE_DIR="$TEST_TMP/singbox-update-state"
+        SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
+        # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
+        SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
         mkdir -p "$fake_bin"
-        printf '%s\n' old-binary > "$fake_bin/sing-box"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
         chmod 755 "$fake_bin/sing-box"
         PATH="$fake_bin:$PATH"
 
@@ -686,12 +774,12 @@ test_failed_singbox_update_restores_binary_and_state() {
         node_exists() { return 1; }
         install_deps() { return 0; }
         prepare_singbox_rollback_package() {
-            local package="$2/sing-box-old.pkg"
+            local package="$2/sing-box-old.deb"
             : > "$package"
             printf '%s\n' "$package"
         }
         install_singbox_package_file() {
-            cp "$update_backup/sing-box" "$fake_bin/sing-box"
+            cp "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" "$fake_bin/sing-box"
         }
         run_singbox_installer() {
             printf '%s\n' broken-new-binary > "$fake_bin/sing-box"
@@ -715,9 +803,171 @@ test_failed_singbox_update_restores_binary_and_state() {
         if update_singbox >"$output" 2>&1; then
             fail "安装器失败时 update_singbox 应返回失败"
         fi
-        assert_file_contains "$fake_bin/sing-box" '^old-binary$'
+        assert_file_contains "$fake_bin/sing-box" '^#!/bin/sh$'
         assert_file_contains "$TEST_TMP/restored-service-state" '^1 1$'
-        [ -f "$update_backup/sing-box" ] || fail "更新失败后应保留旧二进制备份"
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "旧二进制和服务状态完整恢复后应清理持久事务"
+    )
+}
+
+test_port_detection_failures_are_not_treated_as_free() {
+    (
+        local status
+        ss() { return 127; }
+        ssh_effective_ports_csv() { printf '%s\n' 22; }
+
+        if port_in_use_tcp 43333; then
+            fail "ss 失败时不得报告端口被正常识别为占用"
+        else
+            status=$?
+        fi
+        [ "$status" -gt 1 ] || fail "ss 失败必须与端口空闲状态区分"
+        if random_port tcp >/dev/null 2>&1; then
+            fail "监听探测失败时不得随机选出端口"
+        fi
+    )
+    (
+        ss() { return 0; }
+        ssh_effective_ports_csv() { return 23; }
+        if random_port tcp >/dev/null 2>&1; then
+            fail "SSH 生效端口读取失败时不得随机选出端口"
+        fi
+    )
+}
+
+test_lockdir_reclaim_guard_serializes_contenders() {
+    (
+        local critical="$TEST_TMP/lock-reclaim-critical" overlap="$TEST_TMP/lock-reclaim-overlap"
+        LOCK_RECLAIM_DIR="$TEST_TMP/lock-reclaim-guard"
+        rm -rf -- "$LOCK_RECLAIM_DIR" "$critical" "$overlap"
+        run_contender() {
+            acquire_lockdir_reclaim_guard || return 1
+            if ! mkdir "$critical" 2>/dev/null; then
+                : > "$overlap"
+            else
+                sleep 0.2
+                rmdir "$critical"
+            fi
+            release_lockdir_reclaim_guard
+        }
+
+        run_contender &
+        local first=$!
+        run_contender &
+        local second=$!
+        wait "$first"
+        wait "$second"
+        [ ! -e "$overlap" ] || fail "锁目录回收临界区发生并发重叠"
+
+        mkdir "$LOCK_RECLAIM_DIR"
+        acquire_lockdir_reclaim_guard ||
+            fail "写入 owner 前中断留下的空回收目录应可安全回收"
+        lockdir_reclaim_owned_by_self ||
+            fail "回收空目录后必须建立当前进程的有效所有者元数据"
+        release_lockdir_reclaim_guard
+    )
+}
+
+test_openrc_service_does_not_inherit_menu_lock_fd() {
+    (
+        VPSBOX_TEST_MODE=0
+        # shellcheck disable=SC2034 # 被测的 service_start 动态读取。
+        OS=alpine
+        is_systemd() { return 1; }
+        retry() {
+            shift 2
+            "$@"
+        }
+        rc-service() {
+            [ ! -e "/proc/$BASHPID/fd/200" ] ||
+                fail "OpenRC 服务命令继承了菜单锁 FD 200"
+        }
+        exec 200>"$TEST_TMP/openrc-menu-lock"
+
+        service_start
+        [ -e "/proc/$BASHPID/fd/200" ] ||
+            fail "关闭子命令 FD 不得关闭父菜单自己的锁"
+        exec 200>&-
+    )
+}
+
+test_singbox_pending_update_recovers_on_next_start() {
+    (
+        local fake_bin="$TEST_TMP/singbox-recovery/bin" backup="$TEST_TMP/singbox-recovery/old"
+        local package="$TEST_TMP/singbox-recovery/old.deb" state_log="$TEST_TMP/singbox-recovery/service"
+        mkdir -p "$fake_bin"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
+        chmod 755 "$fake_bin/sing-box"
+        cp -a "$fake_bin/sing-box" "$backup"
+        : > "$package"
+        PATH="$fake_bin:$PATH"
+        VPSBOX_STATE_DIR="$TEST_TMP/singbox-recovery/state"
+        SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
+        SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
+
+        persist_singbox_update_transaction \
+            "$fake_bin/sing-box" "$backup" "$package" 1.13.13 1 1
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.14\n"' > "$fake_bin/sing-box"
+        chmod 755 "$fake_bin/sing-box"
+        service_stop() { return 0; }
+        service_manager_is_active() { return 1; }
+        stop_singbox_config_processes() { return 0; }
+        node_exists() { return 1; }
+        install_singbox_package_file() {
+            cp -a "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" "$fake_bin/sing-box"
+        }
+        restore_singbox_service_state() { printf '%s %s\n' "$1" "$2" > "$state_log"; }
+
+        recover_pending_singbox_update >/dev/null
+        assert_eq 1.13.13 "$(singbox_version)"
+        assert_file_contains "$state_log" '^1 1$'
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "完整恢复后必须删除 sing-box 更新事务"
+    )
+}
+
+test_singbox_atomic_restore_preserves_current_on_replace_failure() {
+    (
+        local dir="$TEST_TMP/singbox-atomic" target backup
+        mkdir -p "$dir"
+        target="$dir/sing-box"
+        backup="$dir/old-binary"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.14\n"' > "$target"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$backup"
+        chmod 755 "$target" "$backup"
+        mv() { return 23; }
+
+        if restore_singbox_binary_atomically "$backup" "$target" 1.13.13; then
+            fail "最终原子替换失败时不得报告恢复成功"
+        fi
+        assert_eq 1.13.14 "$(singbox_binary_version_at "$target")" \
+            "原子替换失败不得截断或覆盖当前二进制"
+    )
+}
+
+test_singbox_recovery_rejects_corrupted_backup() {
+    (
+        local fake_bin="$TEST_TMP/singbox-corrupt/bin" backup="$TEST_TMP/singbox-corrupt/old"
+        local package="$TEST_TMP/singbox-corrupt/old.deb"
+        mkdir -p "$fake_bin"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
+        chmod 755 "$fake_bin/sing-box"
+        cp -a "$fake_bin/sing-box" "$backup"
+        : > "$package"
+        PATH="$fake_bin:$PATH"
+        VPSBOX_STATE_DIR="$TEST_TMP/singbox-corrupt/state"
+        SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
+        # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
+        SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
+        persist_singbox_update_transaction \
+            "$fake_bin/sing-box" "$backup" "$package" 1.13.13 0 0
+        printf '%s\n' tampered >> "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary"
+
+        if recover_pending_singbox_update >/dev/null 2>&1; then
+            fail "哈希损坏的 sing-box 备份不得用于恢复"
+        fi
+        [ -d "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "校验失败时必须保留恢复记录供人工处理"
     )
 }
 
@@ -758,6 +1008,10 @@ main() {
         test_node_eof_has_no_mutation
         test_interactive_confirm_is_function_local
         test_ss_password_generation_failure_rolls_back_before_mutation
+        test_first_singbox_install_marks_transaction_before_install
+        test_atomic_root_publish_preserves_existing_target
+        test_runtime_dir_permission_failure_is_fatal
+        test_lockdir_first_acquisition_uses_reclaim_guard
         test_reality_checks_require_bounded_dns_and_openssl
         test_view_node_propagates_uri_failure
         test_node_state_writes_are_atomic
@@ -779,6 +1033,12 @@ main() {
         test_same_second_timestamp_is_not_after
         test_singbox_dependency_failure_does_not_touch_service
         test_failed_singbox_update_restores_binary_and_state
+        test_port_detection_failures_are_not_treated_as_free
+        test_lockdir_reclaim_guard_serializes_contenders
+        test_openrc_service_does_not_inherit_menu_lock_fd
+        test_singbox_pending_update_recovers_on_next_start
+        test_singbox_atomic_restore_preserves_current_on_replace_failure
+        test_singbox_recovery_rejects_corrupted_backup
         test_external_singbox_update_is_rejected_before_mutation
     )
 

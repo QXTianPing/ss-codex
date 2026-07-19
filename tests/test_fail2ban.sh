@@ -313,6 +313,7 @@ test_sync_validation_failure_rolls_back() {
     begin_change_transaction() { return 0; }
     ssh_effective_ports_csv() { printf '6384\n'; }
     is_systemd() { return 0; }
+    chown() { return 0; }
     systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
     mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
 
@@ -448,6 +449,36 @@ test_fail2ban_backup_rotation_keeps_five() {
     [ -e "${FAIL2BAN_VPSBOX_SSHD_CONF}.bak.20260101000008" ] || fail "最新备份不应删除"
 }
 
+test_fail2ban_atomic_restore_preserves_current_on_failure() {
+    (
+        local dir="$TEST_TMP/fail2ban-atomic-restore"
+        mkdir -p "$dir"
+        FAIL2BAN_VPSBOX_SSHD_CONF="$dir/99-vpsbox-sshd.local"
+        printf '%s\n' old > "$dir/backup"
+        printf '%s\n' current > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        chown() { return 0; }
+        mv() { return 1; }
+
+        if restore_fail2ban_sshd_config_file "$dir/backup"; then
+            fail "Fail2ban 原子恢复替换失败时不得报告成功"
+        fi
+        assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^current$'
+    )
+}
+
+test_fail2ban_rollback_failure_is_reported() {
+    (
+        local output="$TEST_TMP/fail2ban-rollback-failure.out"
+        restore_fail2ban_sshd_sync_state() { return 23; }
+
+        if fail2ban_sync_failure_with_rollback "Fail2ban 测试失败" "" 0 >"$output" 2>&1; then
+            fail "Fail2ban 回滚失败路径不得报告成功"
+        fi
+        assert_file_contains "$output" '同步前状态未能完整恢复'
+        assert_file_not_contains "$output" '已恢复同步前的配置与服务状态'
+    )
+}
+
 main() {
     local -a required=(
         fail2ban_action_names
@@ -474,6 +505,8 @@ main() {
         test_install_fail2ban_healthy_is_noop
         test_installed_fail2ban_repairs_without_package_manager
         test_fail2ban_backup_rotation_keeps_five
+        test_fail2ban_atomic_restore_preserves_current_on_failure
+        test_fail2ban_rollback_failure_is_reported
     )
 
     for name in "${required[@]}"; do

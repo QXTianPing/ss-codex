@@ -516,7 +516,7 @@ node_exists() { return 1; }
 install_deps() { printf '%s\n' deps >> "$MOCK_SINGBOX_EVENT_LOG"; }
 singbox_binary_is_package_managed() { return 0; }
 prepare_singbox_rollback_package() {
-    local package="$2/sing-box-old.pkg"
+    local package="$2/sing-box-old.deb"
     : > "$package"
     printf '%s\n' "$package"
 }
@@ -533,12 +533,17 @@ reset_singbox_case() {
 
     MOCK_SINGBOX_EVENT_LOG="$TEST_TMP/singbox-$name.log"
     : > "$MOCK_SINGBOX_EVENT_LOG"
+    VPSBOX_STATE_DIR="$TEST_TMP/singbox-$name-state"
+    SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
+    # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
+    SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
+    VPSBOX_TEST_MODE=1
 }
 
 test_singbox_version_guards() {
     local fake_bin="$TEST_TMP/bin"
     mkdir -p "$fake_bin"
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/sing-box"
+    printf '#!/usr/bin/env bash\nprintf \"sing-box version 1.13.13\\n\"\n' > "$fake_bin/sing-box"
     chmod 755 "$fake_bin/sing-box"
     PATH="$fake_bin:$PATH"
 

@@ -112,11 +112,15 @@ test_port_decimal_normalization() {
 test_public_listener_address_classification() {
     local addr
 
-    for addr in 0.0.0.0 '*' :: '[::]' 1.1.1.1 2606:4700:4700::1111; do
+    for addr in 0.0.0.0 '*' :: '[::]' 1.1.1.1 192.0.0.9 192.0.0.10 192.0.1.1 \
+        2606:4700:4700::1111 100:1::1 2001:3::1 3fff:1000::1 ::ffff:0808:0808; do
         is_public_listen_addr "$addr" || fail "应识别为公网监听地址：$addr"
     done
     for addr in 127.0.0.1 ::1 10.0.0.1 100.64.1.2 169.254.1.1 172.16.0.1 \
-        192.168.1.1 198.18.0.1 203.0.113.1 fe80::1%ens3 '[fe80::1]%ens3' fd00::1 ff02::1 2001:db8::1; do
+        192.0.0.1 192.0.2.1 192.168.1.1 198.18.0.1 203.0.113.1 \
+        fe80::1%ens3 '[fe80::1]%ens3' fd00::1 ff02::1 100::1 100:0:0:1::1 \
+        2001:2::1 2001:10::1 2001:1f::1 2001:20::1 2001:2f::1 \
+        2001:db8::1 3fff:0fff::1 ::ffff:c0a8:101; do
         if is_public_listen_addr "$addr"; then
             fail "不应识别为公网监听地址：$addr"
         fi

@@ -8,6 +8,19 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck source=../vpsbox.sh
 source "$REPO_DIR/vpsbox.sh"
 
+mkdir -p "$TEST_TMP/bin"
+cat > "$TEST_TMP/bin/sing-box" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+    version) printf 'sing-box version 1.13.14\n' ;;
+    check) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod 755 "$TEST_TMP/bin/sing-box"
+PATH="$TEST_TMP/bin:$PATH"
+export PATH
+
 # Windows 挂载上的 WSL 测试目录不允许普通测试用户 chown root；节点权限本身由既有回归覆盖。
 chown() { return 0; }
 node_file_is_secure() {
@@ -326,6 +339,7 @@ test_stopped_sibling_port_is_rejected() {
     (
         local output="$TEST_TMP/sibling-port.out"
         docker_reserved_ports_for_port_choice() { printf '\n'; }
+        ssh_effective_ports_csv() { printf '%s\n' 22; }
         port_is_effective_ssh_port() { return 1; }
         port_in_use_for_protocols() { return 1; }
 
@@ -339,6 +353,7 @@ test_stopped_target_port_is_rechecked_against_system_listeners() {
     (
         local output="$TEST_TMP/stopped-target-port.out"
         docker_reserved_ports_for_port_choice() { printf '\n'; }
+        ssh_effective_ports_csv() { printf '%s\n' 22; }
         port_is_effective_ssh_port() { return 1; }
         singbox_config_pids() { return 0; }
         port_in_use_for_protocols() { [ "$1" = 20001 ]; }
@@ -362,7 +377,10 @@ test_delete_one_protocol_keeps_sibling_running() {
         write_uri_files
         : > "$event_log"
 
-        backup_node_files() { mkdir -p "$1"; }
+        begin_node_transaction() { printf 'transaction\n' >> "$event_log"; }
+        mark_node_transaction_mutated() { printf 'mutated\n' >> "$event_log"; }
+        commit_node_transaction() { printf 'commit\n' >> "$event_log"; }
+        rollback_active_node_transaction() { printf 'rollback\n' >> "$event_log"; }
         firewall_prepare_port_transition() { printf 'prepare\n' >> "$event_log"; }
         service_stop() { printf 'stop\n' >> "$event_log"; }
         stop_singbox_config_processes() { return 0; }
@@ -398,7 +416,10 @@ test_delete_last_protocol_disables_service() {
         write_uri_files
         : > "$event_log"
 
-        backup_node_files() { mkdir -p "$1"; }
+        begin_node_transaction() { printf 'transaction\n' >> "$event_log"; }
+        mark_node_transaction_mutated() { printf 'mutated\n' >> "$event_log"; }
+        commit_node_transaction() { printf 'commit\n' >> "$event_log"; }
+        rollback_active_node_transaction() { printf 'rollback\n' >> "$event_log"; }
         firewall_prepare_port_transition() { printf 'prepare\n' >> "$event_log"; }
         service_stop() { printf 'stop\n' >> "$event_log"; }
         stop_singbox_config_processes() { return 0; }
@@ -424,13 +445,11 @@ test_dual_node_backup_restore_round_trip() {
         local backup="$TEST_TMP/dual-backup"
         set_node_paths "$TEST_TMP/backup-round-trip"
         mkdir -p "$NODE_CONFIG_DIR"
-        printf 'ss-config\n' > "$SS_CONFIG_PATH"
-        printf 'vless-config\n' > "$VLESS_CONFIG_PATH"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
         write_ss_state_fixture "$SS_STATE_FILE"
         write_vless_state_fixture "$VLESS_STATE_FILE"
-        printf 'ss-link\n' > "$SS_URI_FILE"
-        printf 'vless-link\n' > "$VLESS_URI_FILE"
-        printf 'ss-link\nvless-link\n' > "$URI_FILE"
+        write_uri_files
 
         service_is_running() { return 1; }
         service_is_enabled() { return 1; }
@@ -453,11 +472,11 @@ test_dual_node_backup_restore_round_trip() {
 
         restore_node_files "$backup" >/dev/null
 
-        assert_file_contains "$SS_CONFIG_PATH" '^ss-config$'
-        assert_file_contains "$VLESS_CONFIG_PATH" '^vless-config$'
+        assert_file_contains "$SS_CONFIG_PATH" '"type": "shadowsocks"'
+        assert_file_contains "$VLESS_CONFIG_PATH" '"type": "vless"'
         assert_file_contains "$SS_STATE_FILE" '^PROTOCOL=shadowsocks$'
         assert_file_contains "$VLESS_STATE_FILE" '^PROTOCOL=vless-reality$'
-        assert_file_contains "$URI_FILE" '^ss-link$'
+        assert_file_contains "$URI_FILE" '^ss://'
     )
 }
 
@@ -551,6 +570,7 @@ test_pending_transaction_recovers_after_hard_interruption() {
         service_is_enabled() { return 1; }
 
         begin_node_transaction
+        mark_node_transaction_mutated
         printf 'broken\n' > "$SS_CONFIG_PATH"
         rm -f "$SS_STATE_FILE" "$URI_FILE" "$SS_URI_FILE"
         ACTIVE_NODE_BACKUP=""
@@ -574,6 +594,52 @@ test_pending_transaction_recovers_after_hard_interruption() {
     )
 }
 
+test_unmodified_pending_transaction_is_discarded_without_service_stop() {
+    (
+        set_node_paths "$TEST_TMP/pending-unmodified"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        begin_node_transaction
+        ACTIVE_NODE_BACKUP=""
+        service_stop() { fail "尚未修改节点文件时不得停止 sing-box"; }
+
+        recover_pending_node_transaction >/dev/null
+
+        assert_file_contains "$SS_CONFIG_PATH" '"type": "shadowsocks"'
+        [ ! -e "$NODE_TRANSACTION_DIR" ] ||
+            fail "没有 mutated 标记的 pending 事务应直接清理"
+    )
+}
+
+test_corrupted_node_backup_is_rejected_before_overwrite() {
+    (
+        set_node_paths "$TEST_TMP/pending-corrupt"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        begin_node_transaction
+        mark_node_transaction_mutated
+        printf '%s\n' tampered >> "$NODE_TRANSACTION_BACKUP/ss-state.env"
+        printf '%s\n' current-live > "$SS_CONFIG_PATH"
+        ACTIVE_NODE_BACKUP=""
+        service_stop() { fail "备份校验失败时不得停止或覆盖现有服务"; }
+
+        if recover_pending_node_transaction >/dev/null 2>&1; then
+            fail "哈希损坏的节点备份不得自动恢复"
+        fi
+        assert_file_contains "$SS_CONFIG_PATH" '^current-live$'
+        [ -d "$NODE_TRANSACTION_BACKUP" ] ||
+            fail "损坏的事务备份必须保留供人工处理"
+    )
+}
+
 test_failed_recovery_keeps_transaction_backup() {
     (
         set_node_paths "$TEST_TMP/pending-stop-failure"
@@ -584,6 +650,7 @@ test_failed_recovery_keeps_transaction_backup() {
         service_is_running() { return 1; }
         service_is_enabled() { return 1; }
         begin_node_transaction
+        mark_node_transaction_mutated
         printf 'broken\n' > "$SS_CONFIG_PATH"
         ACTIVE_NODE_BACKUP=""
 
@@ -861,6 +928,8 @@ main() {
         test_verify_runtime_checks_both_protocols
         test_cancel_eof_and_input_interrupt_have_no_mutation
         test_pending_transaction_recovers_after_hard_interruption
+        test_unmodified_pending_transaction_is_discarded_without_service_stop
+        test_corrupted_node_backup_is_rejected_before_overwrite
         test_failed_recovery_keeps_transaction_backup
         test_committed_transaction_is_not_rolled_back
         test_config_state_identity_and_credentials_must_match

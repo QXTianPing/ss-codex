@@ -407,6 +407,50 @@ test_existing_ssh_baseline_survives_later_rollback() {
         fail "后续事务失败不应删除此前成功应用所需的 SSH 基线"
 }
 
+test_ssh_hardening_requires_listener_after_restart() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-hardening-listener/etc/ssh"
+        local log="$TEST_TMP/ssh-hardening-listener.log"
+        local wait_calls=0
+        reset_change_store ssh-hardening-listener
+        mkdir -p "$ssh_dir/sshd_config.d"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        printf '%s\n' 'Port 6384' > "$SSHD_MAIN_CONF"
+        : > "$log"
+
+        sshd_binary() { printf '%s\n' /bin/true; }
+        settle_stale_unapplied_ssh_tracking() { return 0; }
+        ssh_basic_hardening_effective() { return 1; }
+        backup_change_file_once() { return 0; }
+        ssh_effective_ports_csv() { printf '%s\n' 6384; }
+        manifest_set_once() { return 0; }
+        backup_ssh_file() { printf '%s\n' "$TEST_TMP/ssh-hardening-backup"; }
+        mark_change_applied() { return 0; }
+        write_vpsbox_ssh_hardening_config() { return 0; }
+        ensure_sshd_dropin_include() { return 0; }
+        validate_ssh_hardening_effective_config() { return 0; }
+        restart_ssh_service() { printf '%s\n' restart >> "$log"; }
+        wait_for_any_ssh_listener_csv() {
+            wait_calls=$((wait_calls + 1))
+            printf 'wait:%s:%s\n' "$wait_calls" "$1" >> "$log"
+            [ "$wait_calls" -gt 1 ]
+        }
+        restore_ssh_config_backup() { printf '%s\n' restore >> "$log"; }
+        clear_ssh_change_tracking() { printf '%s\n' clear >> "$log"; }
+
+        if apply_ssh_basic_hardening <<< "y" >"$TEST_TMP/ssh-hardening-listener.out" 2>&1; then
+            fail "SSH 重启后原端口未监听时加固不得报告成功"
+        fi
+        assert_file_contains "$log" '^wait:1:6384$'
+        assert_file_contains "$log" '^restore$' "监听验证失败后必须回滚配置"
+        assert_file_contains "$log" '^wait:2:6384$' "回滚后必须再次确认原端口监听"
+        assert_file_contains "$log" '^clear$'
+    )
+}
+
 test_ssh_pre_mark_failure_cleans_first_baseline() {
     local ssh_dir="$TEST_TMP/ssh-pre-mark/etc/ssh"
 
@@ -478,6 +522,266 @@ test_stale_unapplied_ssh_baseline_is_removed_on_next_run() {
 
     assert_ssh_tracking_cleared
     assert_eq 0 "$ACTIVE_UNAPPLIED_SSH_TRACKING"
+}
+
+test_absent_resolv_conf_is_created_successfully() {
+    (
+        reset_change_store dns-absent
+        RESOLV_CONF="$TEST_TMP/dns-absent/resolv.conf"
+        verify_dns_resolution() { return 2; }
+
+        write_resolv_conf_dns 1.1.1.1 8.8.8.8 >/dev/null
+
+        assert_file_contains "$RESOLV_CONF" '^nameserver 1\.1\.1\.1$'
+        assert_file_contains "$RESOLV_CONF" '^nameserver 8\.8\.8\.8$'
+        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_DNS_RESOLV=1$'
+    )
+}
+
+test_sshd_include_only_activates_vpsbox_files() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-explicit-include"
+        mkdir -p "$ssh_dir/sshd_config.d"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
+        printf '%s\n' 'PasswordAuthentication yes' > "$SSHD_CONFIG_DIR/90-dormant.conf"
+
+        ensure_sshd_dropin_include
+
+        assert_file_contains "$SSHD_MAIN_CONF" \
+            "^Include $SSHD_VPSBOX_PORT_CONF $SSHD_VPSBOX_HARDENING_CONF$"
+        assert_file_not_contains "$SSHD_MAIN_CONF" 'sshd_config\.d/\*\.conf'
+        assert_file_contains "$SSHD_CONFIG_DIR/90-dormant.conf" '^PasswordAuthentication yes$'
+    )
+}
+
+test_enabled_inactive_ssh_socket_is_detected() {
+    (
+        is_systemd() { return 0; }
+        systemctl() {
+            case "$*" in
+                "is-active --quiet "*) return 1 ;;
+                "is-enabled --quiet ssh.socket") return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+
+        ssh_socket_activation_enabled_or_active ||
+            fail "已启用但未运行的 ssh.socket 必须被识别"
+    )
+}
+
+test_multiple_ssh_socket_streams_are_parsed() {
+    (
+        is_systemd() { return 0; }
+        systemctl() {
+            case "$*" in
+                "is-active --quiet ssh.socket") return 0 ;;
+                "is-active --quiet sshd.socket") return 1 ;;
+                "show ssh.socket --property=Listen --value")
+                    printf '%s\n' '0.0.0.0:22 (Stream) [::]:2222 (Stream)'
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+
+        assert_eq "22,2222" "$(ssh_socket_activation_ports_csv)" \
+            "多个 ListenStream 端口必须全部保留"
+    )
+}
+
+test_ssh_restore_does_not_require_current_config_to_parse() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-invalid-current" transition_log="$TEST_TMP/ssh-invalid-transition"
+        reset_change_store ssh-invalid-current
+        mkdir -p "$ssh_dir/sshd_config.d"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        printf '%s\n' broken > "$SSHD_MAIN_CONF"
+        # shellcheck disable=SC2034 # 被测的 SSH 连接端口解析函数动态读取。
+        SSH_CONNECTION="192.0.2.10 50000 192.0.2.20 6384"
+        manifest_value() {
+            case "$1" in
+                APPLIED_SSH_CONFIG) printf '%s\n' 1 ;;
+                SSH_PORTS) printf '%s\n' 22 ;;
+                *) return 1 ;;
+            esac
+        }
+        ssh_listening_ports_csv() { printf '%s\n' 23333; }
+        ssh_effective_ports_csv() { fail "损坏配置恢复入口不得调用 sshd -T"; }
+        ssh_firewall_transition_begin() { printf '%s\n' "$1" > "$transition_log"; }
+        restore_change_file() { return 0; }
+        sshd_binary() { printf '%s\n' /bin/true; }
+        restart_ssh_service() { return 0; }
+        wait_for_any_ssh_listener_csv() { return 0; }
+        ssh_firewall_transition_finish() { return 0; }
+        clear_ssh_change_tracking() { return 0; }
+        sync_fail2ban_sshd_port() { return 0; }
+
+        restore_vpsbox_ssh_config <<< "YES" >/dev/null
+        assert_file_contains "$transition_log" '^22,6384,23333$'
+    )
+}
+
+test_failed_ssh_restore_preserves_retry_snapshot() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-restore-snapshot/etc/ssh"
+        local snapshot
+        reset_change_store ssh-restore-snapshot
+        mkdir -p "$ssh_dir/sshd_config.d"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        printf '%s\n' broken > "$SSHD_MAIN_CONF"
+        manifest_value() {
+            case "$1" in
+                APPLIED_SSH_CONFIG) printf '%s\n' 1 ;;
+                SSH_PORTS) printf '%s\n' 22 ;;
+                *) return 1 ;;
+            esac
+        }
+        ssh_listening_ports_csv() { printf '%s\n' 23333; }
+        ssh_firewall_transition_begin() { return 0; }
+        restore_change_file() { return 1; }
+        settle_failed_ssh_restore() { return 1; }
+
+        if restore_vpsbox_ssh_config <<< "YES" >/dev/null 2>&1; then
+            fail "SSH 配置恢复失败时不得报告成功"
+        fi
+        snapshot="$(find "$(ssh_restore_snapshot_root)" -maxdepth 1 -type d -name 'restore.*' -print -quit)"
+        [ -d "$snapshot" ] || fail "二次回滚失败后必须保留恢复前快照"
+        assert_file_contains "$snapshot/main" '^broken$'
+    )
+}
+
+test_ssh_config_publish_failure_preserves_target() {
+    (
+        local dir="$TEST_TMP/ssh-atomic-publish"
+        mkdir -p "$dir"
+        printf '%s\n' old > "$dir/target"
+        printf '%s\n' new > "$dir/source"
+        chown() { return 0; }
+        mv() { return 1; }
+
+        if install_ssh_config_atomically "$dir/source" "$dir/target" 644; then
+            fail "SSH 配置原子替换失败时不应报告成功"
+        fi
+        assert_file_contains "$dir/target" '^old$' "发布失败时必须保留原 SSH 配置"
+        if find "$dir" -maxdepth 1 -name '.vpsbox-publish.*' -print -quit | grep -q .; then
+            fail "SSH 配置发布失败后不应遗留临时文件"
+        fi
+    )
+}
+
+test_ssh_restore_snapshot_integrity_is_verified() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-snapshot-integrity/etc/ssh" snapshot=""
+        reset_change_store ssh-snapshot-integrity
+        mkdir -p "$ssh_dir/sshd_config.d"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        printf '%s\n' original > "$SSHD_MAIN_CONF"
+        printf '%s\n' 'Port 23333' > "$SSHD_VPSBOX_PORT_CONF"
+
+        create_ssh_restore_snapshot snapshot
+        [[ "$snapshot" == "$(ssh_restore_snapshot_root)"/restore.* ]] ||
+            fail "SSH 恢复快照必须位于 vpsbox 持久状态目录"
+        ssh_restore_snapshot_dir_valid "$snapshot" ||
+            fail "新建的 SSH 恢复快照应通过完整性校验"
+
+        printf '%s\n' tampered > "$snapshot/main"
+        printf '%s\n' current > "$SSHD_MAIN_CONF"
+        if restore_ssh_runtime_snapshot "$snapshot" ""; then
+            fail "被篡改的 SSH 恢复快照不得用于恢复"
+        fi
+        assert_file_contains "$SSHD_MAIN_CONF" '^current$' \
+            "快照校验失败时不得修改现有 SSH 配置"
+    )
+}
+
+test_dns_verification_uses_bounded_command() {
+    (
+        local log="$TEST_TMP/dns-verify-bounded.log"
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "getent" ]; then
+                return 0
+            fi
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "resolvectl" ]; then
+                return 1
+            fi
+            builtin command "$@"
+        }
+        run_bounded_command() {
+            printf '%s\n' "$*" > "$log"
+            printf '%s\n' '192.0.2.1 STREAM example.com'
+        }
+
+        verify_dns_resolution || fail "有界 DNS 命令返回地址时应验证成功"
+        assert_file_contains "$log" '^8 getent ahosts example[.]com$'
+    )
+}
+
+test_nexttrace_probe_uses_bounded_command() {
+    (
+        local log="$TEST_TMP/nexttrace-bounded.log"
+        run_bounded_command() {
+            printf '%s\n' "$*" > "$log"
+        }
+
+        run_nexttrace_sized_target 1.1.1.1 40000 1450
+        assert_file_contains "$log" \
+            '^30 nexttrace -n -P -C -T -p 80 --source-port 40000 --parallel-requests 1 --queries [0-9]+ --psize 1450 1[.]1[.]1[.]1$'
+    )
+}
+
+test_hostname_failure_restores_current_operation_state() {
+    (
+        local runtime_hostname="first.example" fail_hosts_publish=1
+        reset_change_store hostname-second-failure
+        HOSTNAME_PATH="$TEST_TMP/hostname-second-failure/hostname"
+        HOSTS_PATH="$TEST_TMP/hostname-second-failure/hosts"
+        printf '%s\n' first.example > "$HOSTNAME_PATH"
+        printf '%s\n' '127.0.0.1 localhost' '192.0.2.10 user-entry' > "$HOSTS_PATH"
+        printf '%s\n' baseline.example > "$CHANGE_BACKUP_DIR/HOSTNAME_FILE"
+        printf '%s\n' '127.0.0.1 baseline' > "$CHANGE_BACKUP_DIR/HOSTS_FILE"
+        cat > "$CHANGE_MANIFEST" <<'EOF'
+BACKUP_HOSTNAME_FILE=file
+BACKUP_HOSTS_FILE=file
+HOSTNAME_VALUE=baseline.example
+APPLIED_HOSTNAME=1
+EOF
+        hostname_current_value() { printf '%s\n' "$runtime_hostname"; }
+        set_system_hostname() { runtime_hostname="$1"; }
+        mv() {
+            local source target
+            local -a args=("$@")
+            source="${args[${#args[@]}-2]}"
+            target="${args[${#args[@]}-1]}"
+            if [ "$target" = "$HOSTS_PATH" ] && [[ "$source" == */.hosts.vpsbox.* ]] &&
+                [ "$fail_hosts_publish" -eq 1 ]; then
+                fail_hosts_publish=0
+                return 23
+            fi
+            command mv "$@"
+        }
+
+        if change_system_hostname <<< "second.example" >/dev/null 2>&1; then
+            fail "第二次主机名修改的 hosts 发布失败时不得报告成功"
+        fi
+        assert_file_contains "$HOSTNAME_PATH" '^first\.example$'
+        assert_file_contains "$HOSTS_PATH" '^192\.0\.2\.10 user-entry$'
+        assert_eq first.example "$runtime_hostname"
+        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_HOSTNAME=1$'
+        assert_file_not_contains "$CHANGE_MANIFEST" '^PENDING_HOSTNAME='
+    )
 }
 
 test_signal_traps_preserve_exit_status() {
@@ -561,10 +865,22 @@ main() {
         test_first_ssh_port_rollback_clears_tracking
         test_first_ssh_hardening_rollback_clears_tracking
         test_existing_ssh_baseline_survives_later_rollback
+        test_ssh_hardening_requires_listener_after_restart
         test_ssh_pre_mark_failure_cleans_first_baseline
         test_runtime_cleanup_clears_interrupted_ssh_baseline
         test_failed_ssh_tracking_cleanup_remains_retryable
         test_stale_unapplied_ssh_baseline_is_removed_on_next_run
+        test_absent_resolv_conf_is_created_successfully
+        test_sshd_include_only_activates_vpsbox_files
+        test_enabled_inactive_ssh_socket_is_detected
+        test_multiple_ssh_socket_streams_are_parsed
+        test_ssh_restore_does_not_require_current_config_to_parse
+        test_failed_ssh_restore_preserves_retry_snapshot
+        test_ssh_config_publish_failure_preserves_target
+        test_ssh_restore_snapshot_integrity_is_verified
+        test_dns_verification_uses_bounded_command
+        test_nexttrace_probe_uses_bounded_command
+        test_hostname_failure_restores_current_operation_state
         test_signal_traps_preserve_exit_status
         test_uninstall_restore_offer_runs_internal_restore
         test_uninstall_restore_offer_can_preserve_changes

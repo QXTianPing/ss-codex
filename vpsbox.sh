@@ -29,12 +29,17 @@ CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
 NODE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/node-transaction"
 NODE_TRANSACTION_BACKUP="$NODE_TRANSACTION_DIR/backup"
 NODE_TRANSACTION_STAGE="$NODE_TRANSACTION_DIR/stage"
+SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
+SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
 GAI_CONF="/etc/gai.conf"
+RESOLV_CONF="/etc/resolv.conf"
 NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
 NTP_SOURCES_END="# END VPSBOX NTP SOURCES"
 CHRONY_SOURCE_FILE="/etc/chrony/sources.d/vpsbox.sources"
 HOSTNAME_BEGIN="# BEGIN VPSBOX HOSTNAME"
 HOSTNAME_END="# END VPSBOX HOSTNAME"
+HOSTNAME_PATH="/etc/hostname"
+HOSTS_PATH="/etc/hosts"
 SSHD_MAIN_CONF="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
@@ -64,9 +69,11 @@ ACTIVE_BOUNDED_MARKER=""
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
+LOCK_RECLAIM_DIR="$RUNTIME_DIR/lockdir-reclaim"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
 ACTIVE_NODE_BACKUP=""
+ACTIVE_NODE_TRANSACTION_MUTATED=0
 ACTIVE_FIREWALL_TRANSITION_DIR=""
 ACTIVE_SSH_FIREWALL_TRANSITION=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
@@ -386,8 +393,11 @@ prepare_runtime_dir() {
         exit 1
     fi
 
-    chown root:root "$RUNTIME_DIR" 2>/dev/null || true
-    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+    if ! chown root:root "$RUNTIME_DIR" 2>/dev/null ||
+        ! chmod 700 "$RUNTIME_DIR" 2>/dev/null; then
+        err "无法保护运行目录：$RUNTIME_DIR"
+        exit 1
+    fi
 }
 
 is_pid() {
@@ -760,8 +770,101 @@ wait_for_lockdir_metadata() {
     [ -s "$LOCK_DIR/pid" ]
 }
 
+lockdir_reclaim_owner_matches() {
+    local path="$LOCK_RECLAIM_DIR/owner" pid start boot
+
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$path" 2>/dev/null || true)"
+    start="$(awk -F= '$1 == "start_ticks" { print $2; exit }' "$path" 2>/dev/null || true)"
+    boot="$(awk -F= '$1 == "boot_id" { print $2; exit }' "$path" 2>/dev/null || true)"
+    is_pid "$pid" && [[ "$start" =~ ^[0-9]+$ ]] && [ -n "$boot" ] || return 1
+    process_alive "$pid" &&
+        [ "$(process_start_ticks "$pid" 2>/dev/null || true)" = "$start" ] &&
+        [ "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)" = "$boot" ]
+}
+
+lockdir_reclaim_owned_by_self() {
+    local pid self_pid="$BASHPID"
+
+    pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$LOCK_RECLAIM_DIR/owner" 2>/dev/null || true)"
+    [ "$pid" = "$self_pid" ] && lockdir_reclaim_owner_matches
+}
+
+write_lockdir_reclaim_metadata() {
+    local self_pid="$BASHPID" tmp="${LOCK_RECLAIM_DIR}.owner.$BASHPID"
+
+    rm -f -- "$tmp"
+    if ! {
+        printf 'pid=%s\n' "$self_pid"
+        printf 'start_ticks=%s\n' "$(process_start_ticks "$self_pid" || true)"
+        printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+    } > "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$LOCK_RECLAIM_DIR/owner"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+acquire_lockdir_reclaim_guard() {
+    local i
+
+    for i in {1..30}; do
+        if mkdir "$LOCK_RECLAIM_DIR" 2>/dev/null; then
+            if write_lockdir_reclaim_metadata; then
+                return 0
+            fi
+            rm -rf -- "$LOCK_RECLAIM_DIR"
+            return 1
+        fi
+        if [ -L "$LOCK_RECLAIM_DIR" ] ||
+            { [ -e "$LOCK_RECLAIM_DIR" ] && [ ! -d "$LOCK_RECLAIM_DIR" ]; }; then
+            return 1
+        fi
+        # 创建者写 owner 前有极短窗口；先等待，再只回收已确认没有存活持有者的目录。
+        if [ ! -s "$LOCK_RECLAIM_DIR/owner" ]; then
+            sleep 0.1
+            continue
+        fi
+        lockdir_reclaim_owner_matches || {
+            rm -rf -- "$LOCK_RECLAIM_DIR"
+            continue
+        }
+        sleep 0.1
+    done
+    # 创建者若在写 owner 前被 SIGKILL，会留下空回收目录。rmdir 只会删除空目录；
+    # 若另一个存活创建者已写入元数据则原子失败，不会误删有效保护。
+    if [ -d "$LOCK_RECLAIM_DIR" ] && [ ! -L "$LOCK_RECLAIM_DIR" ] &&
+        [ ! -e "$LOCK_RECLAIM_DIR/owner" ] &&
+        rmdir -- "$LOCK_RECLAIM_DIR" 2>/dev/null &&
+        mkdir "$LOCK_RECLAIM_DIR" 2>/dev/null; then
+        if write_lockdir_reclaim_metadata; then
+            return 0
+        fi
+        rm -rf -- "$LOCK_RECLAIM_DIR"
+    fi
+    return 1
+}
+
+release_lockdir_reclaim_guard() {
+    if lockdir_reclaim_owned_by_self; then
+        rm -f -- "$LOCK_RECLAIM_DIR/owner"
+        rmdir -- "$LOCK_RECLAIM_DIR" 2>/dev/null || true
+    fi
+}
+
+activate_lockdir_lock() {
+    write_lockdir_metadata || {
+        rm -rf -- "$LOCK_DIR"
+        return 1
+    }
+    LOCK_USING_DIR=1
+    install_lock_cleanup_traps
+}
+
 acquire_lock() {
     local old_pid=""
+    local reclaim_guard=0
 
     prepare_runtime_dir
 
@@ -799,14 +902,29 @@ acquire_lock() {
         exit 1
     fi
 
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        write_lockdir_metadata
-        LOCK_USING_DIR=1
-        install_lock_cleanup_traps
-        return 0
+    if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
+        err "$LOCK_DIR 不是安全的锁目录，已拒绝使用。"
+        exit 1
     fi
 
+    acquire_lockdir_reclaim_guard || {
+        err "无法取得 vpsbox 锁回收保护，请稍后重试。"
+        exit 1
+    }
+    reclaim_guard=1
+    # 无 flock 时，首次创建和残留锁回收都必须在同一保护内完成，避免锁目录已创建、
+    # 元数据尚未写入时被并发进程误判为残留锁。
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        activate_lockdir_lock || {
+            release_lockdir_reclaim_guard
+            err "vpsbox 锁元数据写入失败。"
+            exit 1
+        }
+        release_lockdir_reclaim_guard
+        return
+    fi
     if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
+        release_lockdir_reclaim_guard
         err "$LOCK_DIR 不是安全的锁目录，已拒绝使用。"
         exit 1
     fi
@@ -816,38 +934,28 @@ acquire_lock() {
     [ -z "$old_pid" ] && old_pid="$(find_running_vpsbox_pid || true)"
     if ! process_alive "$old_pid"; then
         warn "检测到残留 vpsbox 锁，正在清理。"
-        rm -rf "$LOCK_DIR"
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            write_lockdir_metadata
-            LOCK_USING_DIR=1
-            install_lock_cleanup_traps
-            return 0
-        fi
+        rm -rf -- "$LOCK_DIR"
     elif old_menu_lost_terminal "$LOCK_DIR/pid" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
-        rm -rf "$LOCK_DIR"
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            write_lockdir_metadata
-            LOCK_USING_DIR=1
-            install_lock_cleanup_traps
-            return 0
-        fi
+        rm -rf -- "$LOCK_DIR"
     elif terminate_old_vpsbox_menu "$old_pid"; then
-        rm -rf "$LOCK_DIR"
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            write_lockdir_metadata
-            LOCK_USING_DIR=1
-            install_lock_cleanup_traps
-            return 0
-        fi
-    fi
-
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        rm -rf -- "$LOCK_DIR"
+    else
+        release_lockdir_reclaim_guard
         err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
         exit 1
     fi
-    write_lockdir_metadata
-    LOCK_USING_DIR=1
-    install_lock_cleanup_traps
+
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        release_lockdir_reclaim_guard
+        err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
+        exit 1
+    fi
+    activate_lockdir_lock || {
+        release_lockdir_reclaim_guard
+        err "vpsbox 锁元数据写入失败。"
+        exit 1
+    }
+    [ "$reclaim_guard" = "1" ] && release_lockdir_reclaim_guard
 }
 
 detect_os() {
@@ -875,7 +983,48 @@ is_systemd() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+install_root_file_atomically() {
+    local source="$1" target="$2" mode="${3:-644}"
+    local parent tmp
+
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ ! -L "$target" ] || return 1
+    parent="$(dirname "$target")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    command -v mktemp >/dev/null 2>&1 || return 1
+    tmp="$(mktemp "$parent/.vpsbox-publish.XXXXXX")" || return 1
+    if ! cp -- "$source" "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod "$mode" "$tmp" ||
+        ! mv -f -- "$tmp" "$target"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+restore_root_file_snapshot() {
+    local snapshot="$1" target="$2" was_present="$3"
+    local mode
+
+    if [ "$was_present" = "1" ]; then
+        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+        mode="$(stat -c '%a' "$snapshot" 2>/dev/null)" || return 1
+        install_root_file_atomically "$snapshot" "$target" "$mode"
+    else
+        [ ! -L "$target" ] || return 1
+        if [ -e "$target" ] && [ ! -f "$target" ]; then
+            return 1
+        fi
+        rm -f -- "$target"
+    fi
+}
+
 install_command_alias() {
+    if [ ! -f "$CMD_PATH" ] || [ -L "$CMD_PATH" ]; then
+        err "管理命令文件不存在或不安全：$CMD_PATH"
+        return 1
+    fi
     chmod 755 "$CMD_PATH" || {
         err "无法设置管理命令权限：$CMD_PATH"
         return 1
@@ -937,12 +1086,11 @@ download_vpsbox_script() {
     ensure_curl || return 1
 
     mkdir -p "$(dirname "$dest")" || return 1
-    if command -v mktemp >/dev/null 2>&1; then
-        tmp="$(mktemp "${dest}.tmp.XXXXXX")" || return 1
-    else
-        tmp="${dest}.tmp.$$"
-        : > "$tmp"
-    fi
+    command -v mktemp >/dev/null 2>&1 || {
+        err "未找到 mktemp，无法安全创建下载临时文件。"
+        return 1
+    }
+    tmp="$(mktemp "${dest}.tmp.XXXXXX")" || return 1
 
     if ! retry 3 2 fetch_vpsbox_script_once "$tmp" 8 180; then
         rm -f "$tmp"
@@ -1242,10 +1390,11 @@ install_self_command() {
             ;;
     esac
 
-    [ -f "$src" ] || { err "找不到当前 vpsbox 脚本：$src"; return 1; }
+    [ -f "$src" ] && [ ! -L "$src" ] ||
+        { err "找不到当前 vpsbox 脚本，或脚本路径不安全：$src"; return 1; }
 
     if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
-        if ! cp "$src" "$CMD_PATH" 2>/dev/null; then
+        if ! install_root_file_atomically "$src" "$CMD_PATH" 755; then
             err "无法安装管理命令到 $CMD_PATH。"
             return 1
         fi
@@ -1521,6 +1670,15 @@ install_singbox_if_missing() {
     info "sing-box 安装完成：$(singbox_version)"
 }
 
+install_singbox_for_node_transaction() {
+    if ! singbox_installed; then
+        # 首次安装会写入二进制和服务文件，必须先把节点事务标记为已修改，
+        # 这样安装中断后下次启动会恢复安装前的服务状态，而不是丢弃事务。
+        mark_node_transaction_mutated || return 1
+    fi
+    install_singbox_if_missing
+}
+
 refuse_service_mutation_in_test() {
     if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
         err "测试模式禁止调用真实服务管理命令：$1"
@@ -1528,12 +1686,18 @@ refuse_service_mutation_in_test() {
     fi
 }
 
+run_openrc_service() {
+    # OpenRC 可能通过 supervise-daemon 启动长期进程；明确关闭菜单 flock，
+    # 防止守护进程继承 FD 200 后让已退出的 vpsbox 看起来仍持有锁。
+    rc-service "$@" 200>&-
+}
+
 service_start() {
     refuse_service_mutation_in_test service_start || return 1
     if is_systemd; then
         retry 3 2 systemctl start "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        retry 3 2 rc-service "$SERVICE_NAME" start
+        retry 3 2 run_openrc_service "$SERVICE_NAME" start
     else
         err "未检测到 systemd/OpenRC，无法管理服务。"
         return 1
@@ -1545,7 +1709,7 @@ service_stop() {
     if is_systemd; then
         retry 3 2 systemctl stop "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        retry 3 2 rc-service "$SERVICE_NAME" stop
+        retry 3 2 run_openrc_service "$SERVICE_NAME" stop
     else
         err "未检测到 systemd/OpenRC，无法管理服务。"
         return 1
@@ -1588,7 +1752,7 @@ service_manager_is_active() {
     if is_systemd; then
         systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        rc-service "$SERVICE_NAME" status >/dev/null 2>&1
+        run_openrc_service "$SERVICE_NAME" status >/dev/null 2>&1
     else
         return 1
     fi
@@ -1740,6 +1904,7 @@ ipv4_listen_addr_is_public() {
     first=$((10#$first))
     second=$((10#$second))
     third=$((10#$third))
+    fourth=$((10#$fourth))
 
     # IANA special-purpose, private, shared, loopback, link-local, documentation,
     # benchmark, multicast and reserved ranges are not public listener addresses.
@@ -1747,7 +1912,8 @@ ipv4_listen_addr_is_public() {
     (( first == 100 && second >= 64 && second <= 127 )) && return 1
     (( first == 169 && second == 254 )) && return 1
     (( first == 172 && second >= 16 && second <= 31 )) && return 1
-    (( first == 192 && second == 0 )) && return 1
+    (( first == 192 && second == 0 && third == 0 && fourth != 9 && fourth != 10 )) && return 1
+    (( first == 192 && second == 0 && third == 2 )) && return 1
     (( first == 192 && second == 88 && third == 99 )) && return 1
     (( first == 192 && second == 168 )) && return 1
     (( first == 198 && (second == 18 || second == 19) )) && return 1
@@ -1756,8 +1922,40 @@ ipv4_listen_addr_is_public() {
     return 0
 }
 
+ipv6_expand_hextets() {
+    local addr="${1,,}" left right part missing
+    local -a left_parts=() right_parts=() parts=()
+
+    [[ "$addr" == *:* ]] && [[ "$addr" != *.* ]] || return 1
+    if [[ "$addr" == *::* ]]; then
+        [ "${addr#*::}" = "${addr##*::}" ] || return 1
+        left="${addr%%::*}"
+        right="${addr#*::}"
+        [ -z "$left" ] || IFS=':' read -r -a left_parts <<< "$left"
+        [ -z "$right" ] || IFS=':' read -r -a right_parts <<< "$right"
+        missing=$((8 - ${#left_parts[@]} - ${#right_parts[@]}))
+        [ "$missing" -ge 1 ] || return 1
+        parts=("${left_parts[@]}")
+        while [ "$missing" -gt 0 ]; do
+            parts+=(0)
+            missing=$((missing - 1))
+        done
+        parts+=("${right_parts[@]}")
+    else
+        IFS=':' read -r -a parts <<< "$addr"
+        [ "${#parts[@]}" -eq 8 ] || return 1
+    fi
+    [ "${#parts[@]}" -eq 8 ] || return 1
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+        printf '%u ' "$((16#$part))"
+    done
+    printf '\n'
+}
+
 ipv6_listen_addr_is_public() {
-    local addr="${1,,}" embedded
+    local addr="${1,,}" embedded expanded
+    local h0 h1 h2 h3 h4 h5 h6 h7
 
     addr="${addr%%%*}"
     case "$addr" in
@@ -1766,12 +1964,36 @@ ipv6_listen_addr_is_public() {
             ipv4_listen_addr_is_public "$embedded"
             return $?
             ;;
-        ::|::1|0:0:0:0:0:0:0:0|0:0:0:0:0:0:0:1|100:*|fc*|fd*|fe[89ab]*|fe[cdef]*|ff*|2001:2:*|2001:10:*|2001:20:*|2001:db8:*|2002:*|3fff:*|5f00:*)
-            return 1
-            ;;
-        *:*) return 0 ;;
-        *) return 1 ;;
     esac
+
+    expanded="$(ipv6_expand_hextets "$addr")" || return 1
+    read -r h0 h1 h2 h3 h4 h5 h6 h7 <<< "$expanded"
+    if [ "$h0" -eq 0 ] && [ "$h1" -eq 0 ] && [ "$h2" -eq 0 ] &&
+        [ "$h3" -eq 0 ] && [ "$h4" -eq 0 ]; then
+        if [ "$h5" -eq 0 ] && [ "$h6" -eq 0 ] &&
+            { [ "$h7" -eq 0 ] || [ "$h7" -eq 1 ]; }; then
+            return 1
+        fi
+        if [ "$h5" -eq 65535 ]; then
+            embedded="$((h6 >> 8)).$((h6 & 255)).$((h7 >> 8)).$((h7 & 255))"
+            ipv4_listen_addr_is_public "$embedded"
+            return $?
+        fi
+    fi
+
+    # 精确按 IANA 前缀判断，避免用字符串通配把 /64、/48 或 /20 扩大成 /16。
+    (( h0 == 0x0100 && h1 == 0 && h2 == 0 && (h3 == 0 || h3 == 1) )) && return 1
+    (( (h0 & 0xfe00) == 0xfc00 )) && return 1
+    (( (h0 & 0xffc0) == 0xfe80 || (h0 & 0xffc0) == 0xfec0 )) && return 1
+    (( (h0 & 0xff00) == 0xff00 )) && return 1
+    (( h0 == 0x2001 && h1 == 0x0002 && h2 == 0 )) && return 1
+    (( h0 == 0x2001 && (h1 & 0xfff0) == 0x0010 )) && return 1
+    (( h0 == 0x2001 && (h1 & 0xfff0) == 0x0020 )) && return 1
+    (( h0 == 0x2001 && h1 == 0x0db8 )) && return 1
+    (( h0 == 0x2002 )) && return 1
+    (( h0 == 0x3fff && (h1 & 0xf000) == 0 )) && return 1
+    (( h0 == 0x5f00 )) && return 1
+    return 0
 }
 
 is_public_listen_addr() {
@@ -2706,27 +2928,297 @@ write_uri_files() {
 
 backup_node_files() {
     local backup_dir="$1"
-    mkdir -p "$backup_dir" || return 1
+    local manifest="$backup_dir/manifest"
 
-    if [ -f "$URI_FILE" ]; then cp -a "$URI_FILE" "$backup_dir/node-uri.txt" || return 1; fi
-    if [ -d "$NODE_CONFIG_DIR" ]; then cp -a "$NODE_CONFIG_DIR" "$backup_dir/vpsbox.d" || return 1; fi
-    if [ -f "$SS_STATE_FILE" ]; then cp -a "$SS_STATE_FILE" "$backup_dir/ss-state.env" || return 1; fi
-    if [ -f "$VLESS_STATE_FILE" ]; then cp -a "$VLESS_STATE_FILE" "$backup_dir/vless-state.env" || return 1; fi
-    if [ -f "$SS_URI_FILE" ]; then cp -a "$SS_URI_FILE" "$backup_dir/ss-uri.txt" || return 1; fi
-    if [ -f "$VLESS_URI_FILE" ]; then cp -a "$VLESS_URI_FILE" "$backup_dir/vless-uri.txt" || return 1; fi
-    if [ -f /etc/systemd/system/sing-box.service ]; then cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service" || return 1; fi
-    if [ -f /etc/init.d/sing-box ]; then cp -a /etc/init.d/sing-box "$backup_dir/openrc-sing-box" || return 1; fi
+    command -v sha256sum >/dev/null 2>&1 || {
+        err "缺少 sha256sum，无法建立可校验的节点事务备份。"
+        return 1
+    }
+    mkdir -p "$backup_dir" || return 1
+    : > "$manifest" || return 1
+    printf 'version|1\n' >> "$manifest" || return 1
+
+    backup_node_file_with_manifest "$URI_FILE" "$backup_dir/node-uri.txt" \
+        node-uri.txt "$manifest" || return 1
+
+    if [ -d "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ]; then
+        cp -a "$NODE_CONFIG_DIR" "$backup_dir/vpsbox.d" || return 1
+        printf 'dir|vpsbox.d|present|-\n' >> "$manifest" || return 1
+        backup_node_copied_file_with_manifest \
+            "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" \
+            "vpsbox.d/${SS_CONFIG_PATH##*/}" "$manifest" || return 1
+        backup_node_copied_file_with_manifest \
+            "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
+            "vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$manifest" || return 1
+    elif [ ! -e "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ]; then
+        printf 'dir|vpsbox.d|absent|-\n' >> "$manifest" || return 1
+        printf 'file|vpsbox.d/%s|absent|-\n' "${SS_CONFIG_PATH##*/}" >> "$manifest" || return 1
+        printf 'file|vpsbox.d/%s|absent|-\n' "${VLESS_CONFIG_PATH##*/}" >> "$manifest" || return 1
+    else
+        return 1
+    fi
+
+    backup_node_file_with_manifest "$SS_STATE_FILE" "$backup_dir/ss-state.env" \
+        ss-state.env "$manifest" || return 1
+    backup_node_file_with_manifest "$VLESS_STATE_FILE" "$backup_dir/vless-state.env" \
+        vless-state.env "$manifest" || return 1
+    backup_node_file_with_manifest "$SS_URI_FILE" "$backup_dir/ss-uri.txt" \
+        ss-uri.txt "$manifest" || return 1
+    backup_node_file_with_manifest "$VLESS_URI_FILE" "$backup_dir/vless-uri.txt" \
+        vless-uri.txt "$manifest" || return 1
+    backup_node_file_with_manifest /etc/systemd/system/sing-box.service \
+        "$backup_dir/sing-box.service" sing-box.service "$manifest" || return 1
+    backup_node_file_with_manifest /etc/init.d/sing-box \
+        "$backup_dir/openrc-sing-box" openrc-sing-box "$manifest" || return 1
 
     if service_is_running; then
-        echo "1" > "$backup_dir/service-running"
+        printf '1\n' > "$backup_dir/service-running" || return 1
     else
-        echo "0" > "$backup_dir/service-running"
+        printf '0\n' > "$backup_dir/service-running" || return 1
     fi
     if service_is_enabled; then
-        echo "1" > "$backup_dir/service-enabled"
+        printf '1\n' > "$backup_dir/service-enabled" || return 1
     else
-        echo "0" > "$backup_dir/service-enabled"
+        printf '0\n' > "$backup_dir/service-enabled" || return 1
     fi
+    chown root:root "$backup_dir/service-running" "$backup_dir/service-enabled" "$manifest" ||
+        return 1
+    chmod 600 "$backup_dir/service-running" "$backup_dir/service-enabled" "$manifest" ||
+        return 1
+    backup_node_copied_file_with_manifest "$backup_dir/service-running" \
+        service-running "$manifest" || return 1
+    backup_node_copied_file_with_manifest "$backup_dir/service-enabled" \
+        service-enabled "$manifest" || return 1
+}
+
+backup_node_file_with_manifest() {
+    local source="$1" backup="$2" name="$3" manifest="$4"
+    local digest
+
+    if [ -f "$source" ] && [ ! -L "$source" ]; then
+        cp -a -- "$source" "$backup" || return 1
+        digest="$(sha256sum "$backup" | awk '{print $1}')" || return 1
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+        printf 'file|%s|present|%s\n' "$name" "$digest" >> "$manifest"
+    elif [ ! -e "$source" ] && [ ! -L "$source" ]; then
+        printf 'file|%s|absent|-\n' "$name" >> "$manifest"
+    else
+        return 1
+    fi
+}
+
+backup_node_copied_file_with_manifest() {
+    local backup="$1" name="$2" manifest="$3"
+    local digest
+
+    if [ -f "$backup" ] && [ ! -L "$backup" ]; then
+        digest="$(sha256sum "$backup" | awk '{print $1}')" || return 1
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+        printf 'file|%s|present|%s\n' "$name" "$digest" >> "$manifest"
+    elif [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
+        printf 'file|%s|absent|-\n' "$name" >> "$manifest"
+    else
+        return 1
+    fi
+}
+
+node_backup_file_is_safe() {
+    local file="$1" owner group mode
+
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
+        return 0
+    fi
+    owner="$(stat -c '%u' "$file" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$file" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] &&
+        [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+node_backup_manifest_entry() {
+    local manifest="$1" name="$2"
+
+    awk -F'|' -v name="$name" '
+        $2 == name { line=$0; count++ }
+        END {
+            if (count == 1) print line
+            else exit 1
+        }
+    ' "$manifest"
+}
+
+validate_node_backup_file_entry() {
+    local manifest="$1" name="$2" path="$3"
+    local line kind entry_name state digest actual
+
+    line="$(node_backup_manifest_entry "$manifest" "$name")" || return 1
+    IFS='|' read -r kind entry_name state digest <<< "$line"
+    [ "$kind" = "file" ] && [ "$entry_name" = "$name" ] || return 1
+    case "$state" in
+        present)
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+            node_backup_file_is_safe "$path" || return 1
+            actual="$(sha256sum "$path" | awk '{print $1}')" || return 1
+            [ "$actual" = "$digest" ]
+            ;;
+        absent)
+            [ "$digest" = "-" ] && [ ! -e "$path" ] && [ ! -L "$path" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+node_backup_entry_is_present() {
+    local manifest="$1" name="$2" line kind entry_name state digest
+
+    line="$(node_backup_manifest_entry "$manifest" "$name")" || return 2
+    IFS='|' read -r kind entry_name state digest <<< "$line"
+    [ "$entry_name" = "$name" ] || return 2
+    case "$state" in
+        present) return 0 ;;
+        absent) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+validate_node_transaction_backup() {
+    local backup_dir="$1"
+    local manifest="$backup_dir/manifest"
+    local config_dir="$backup_dir/vpsbox.d"
+    local ss_config="$config_dir/${SS_CONFIG_PATH##*/}"
+    local vless_config="$config_dir/${VLESS_CONFIG_PATH##*/}"
+    local line kind name state digest expected="" link protocol path
+    local config_dir_present=0 config_count=0 entry_status
+    local -a entries=(
+        node-uri.txt vpsbox.d "vpsbox.d/${SS_CONFIG_PATH##*/}"
+        "vpsbox.d/${VLESS_CONFIG_PATH##*/}" ss-state.env vless-state.env
+        ss-uri.txt vless-uri.txt sing-box.service openrc-sing-box
+        service-running service-enabled
+    )
+
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
+    node_backup_file_is_safe "$manifest" || return 1
+    [ "$(sed -n '1p' "$manifest")" = "version|1" ] || return 1
+    [ "$(wc -l < "$manifest")" -eq 13 ] || return 1
+    for name in "${entries[@]}"; do
+        node_backup_manifest_entry "$manifest" "$name" >/dev/null || return 1
+    done
+
+    line="$(node_backup_manifest_entry "$manifest" vpsbox.d)" || return 1
+    IFS='|' read -r kind name state digest <<< "$line"
+    [ "$kind" = "dir" ] && [ "$name" = "vpsbox.d" ] && [ "$digest" = "-" ] || return 1
+    case "$state" in
+        present)
+            [ -d "$config_dir" ] && [ ! -L "$config_dir" ] || return 1
+            config_dir_present=1
+            ;;
+        absent)
+            [ ! -e "$config_dir" ] && [ ! -L "$config_dir" ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    validate_node_backup_file_entry "$manifest" node-uri.txt "$backup_dir/node-uri.txt" || return 1
+    validate_node_backup_file_entry "$manifest" "vpsbox.d/${SS_CONFIG_PATH##*/}" "$ss_config" || return 1
+    validate_node_backup_file_entry "$manifest" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$vless_config" || return 1
+    validate_node_backup_file_entry "$manifest" ss-state.env "$backup_dir/ss-state.env" || return 1
+    validate_node_backup_file_entry "$manifest" vless-state.env "$backup_dir/vless-state.env" || return 1
+    validate_node_backup_file_entry "$manifest" ss-uri.txt "$backup_dir/ss-uri.txt" || return 1
+    validate_node_backup_file_entry "$manifest" vless-uri.txt "$backup_dir/vless-uri.txt" || return 1
+    validate_node_backup_file_entry "$manifest" sing-box.service "$backup_dir/sing-box.service" || return 1
+    validate_node_backup_file_entry "$manifest" openrc-sing-box "$backup_dir/openrc-sing-box" || return 1
+    validate_node_backup_file_entry "$manifest" service-running "$backup_dir/service-running" || return 1
+    validate_node_backup_file_entry "$manifest" service-enabled "$backup_dir/service-enabled" || return 1
+
+    grep -Eq '^[01]$' "$backup_dir/service-running" || return 1
+    grep -Eq '^[01]$' "$backup_dir/service-enabled" || return 1
+
+    if node_backup_entry_is_present "$manifest" "vpsbox.d/${SS_CONFIG_PATH##*/}"; then
+        node_backup_entry_is_present "$manifest" ss-state.env || return 1
+        validate_protocol_node_artifacts ss "$ss_config" "$backup_dir/ss-state.env" \
+            "$backup_dir/ss-uri.txt" || return 1
+        config_count=$((config_count + 1))
+    else
+        entry_status=$?
+        [ "$entry_status" -eq 1 ] || return 1
+        if node_backup_entry_is_present "$manifest" ss-state.env; then
+            return 1
+        else
+            entry_status=$?
+            [ "$entry_status" -eq 1 ] || return 1
+        fi
+    fi
+    if node_backup_entry_is_present "$manifest" "vpsbox.d/${VLESS_CONFIG_PATH##*/}"; then
+        node_backup_entry_is_present "$manifest" vless-state.env || return 1
+        validate_protocol_node_artifacts vless "$vless_config" "$backup_dir/vless-state.env" \
+            "$backup_dir/vless-uri.txt" || return 1
+        config_count=$((config_count + 1))
+    else
+        entry_status=$?
+        [ "$entry_status" -eq 1 ] || return 1
+        if node_backup_entry_is_present "$manifest" vless-state.env; then
+            return 1
+        else
+            entry_status=$?
+            [ "$entry_status" -eq 1 ] || return 1
+        fi
+    fi
+    if [ "$config_count" -gt 0 ]; then
+        [ "$config_dir_present" -eq 1 ] || return 1
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            case "$path" in
+                "$ss_config"|"$vless_config") ;;
+                *) return 1 ;;
+            esac
+        done < <(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+        command -v sing-box >/dev/null 2>&1 || return 1
+        sing-box check -C "$config_dir" >/dev/null || return 1
+    elif [ "$config_dir_present" -eq 1 ]; then
+        [ -z "$(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" ] || return 1
+    fi
+
+    if node_backup_entry_is_present "$manifest" node-uri.txt; then
+        for protocol in ss vless; do
+            case "$protocol" in
+                ss)
+                    if node_backup_entry_is_present "$manifest" ss-state.env; then
+                        :
+                    else
+                        entry_status=$?
+                        [ "$entry_status" -eq 1 ] || return 1
+                        continue
+                    fi
+                    load_state_file "$backup_dir/ss-state.env" shadowsocks || return 1
+                    ;;
+                vless)
+                    if node_backup_entry_is_present "$manifest" vless-state.env; then
+                        :
+                    else
+                        entry_status=$?
+                        [ "$entry_status" -eq 1 ] || return 1
+                        continue
+                    fi
+                    load_state_file "$backup_dir/vless-state.env" vless-reality || return 1
+                    ;;
+            esac
+            link="$(generate_link_from_loaded_state)" || return 1
+            [ -n "$expected" ] && expected="${expected}"$'\n'
+            expected="${expected}${link}"
+        done
+        [ -n "$expected" ] && [ "$(cat "$backup_dir/node-uri.txt")" = "$expected" ] || return 1
+    else
+        [ "$?" -eq 1 ] || return 1
+    fi
+}
+
+sync_node_transaction_store() {
+    [ "${VPSBOX_TEST_MODE:-0}" != "1" ] || return 0
+    command -v sync >/dev/null 2>&1 || return 1
+    sync
 }
 
 node_transaction_dir_valid() {
@@ -2790,6 +3282,12 @@ begin_node_transaction() {
         remove_node_transaction_dir || true
         return 1
     fi
+    if ! validate_node_transaction_backup "$NODE_TRANSACTION_BACKUP" ||
+        ! sync_node_transaction_store; then
+        remove_node_transaction_dir || true
+        err "节点事务备份未通过完整性或持久化检查。"
+        return 1
+    fi
     : > "$NODE_TRANSACTION_DIR/pending" || {
         remove_node_transaction_dir || true
         return 1
@@ -2799,7 +3297,35 @@ begin_node_transaction() {
         remove_node_transaction_dir || true
         return 1
     }
+    sync_node_transaction_store || {
+        remove_node_transaction_dir || true
+        return 1
+    }
     ACTIVE_NODE_BACKUP="$NODE_TRANSACTION_DIR"
+    ACTIVE_NODE_TRANSACTION_MUTATED=0
+}
+
+mark_node_transaction_mutated() {
+    [ "${ACTIVE_NODE_BACKUP:-}" = "$NODE_TRANSACTION_DIR" ] || return 1
+    [ -f "$NODE_TRANSACTION_DIR/pending" ] && [ ! -L "$NODE_TRANSACTION_DIR/pending" ] ||
+        return 1
+    : > "$NODE_TRANSACTION_DIR/mutated" || return 1
+    chown root:root "$NODE_TRANSACTION_DIR/mutated" &&
+        chmod 600 "$NODE_TRANSACTION_DIR/mutated" || return 1
+    sync_node_transaction_store || return 1
+    ACTIVE_NODE_TRANSACTION_MUTATED=1
+}
+
+cancel_unmodified_node_transaction() {
+    local transaction_dir="${ACTIVE_NODE_BACKUP:-}"
+
+    [ -n "$transaction_dir" ] || return 0
+    node_transaction_dir_valid "$transaction_dir" || return 1
+    [ "${ACTIVE_NODE_TRANSACTION_MUTATED:-0}" = "0" ] || return 1
+    [ ! -e "$transaction_dir/mutated" ] || return 1
+    ACTIVE_NODE_BACKUP=""
+    ACTIVE_NODE_TRANSACTION_MUTATED=0
+    remove_node_transaction_dir "$transaction_dir"
 }
 
 commit_node_transaction() {
@@ -2808,8 +3334,11 @@ commit_node_transaction() {
     : > "$NODE_TRANSACTION_DIR/committed" || return 1
     chown root:root "$NODE_TRANSACTION_DIR/committed" &&
         chmod 600 "$NODE_TRANSACTION_DIR/committed" || return 1
+    sync_node_transaction_store || return 1
     rm -f -- "$NODE_TRANSACTION_DIR/pending" || return 1
+    sync_node_transaction_store || return 1
     ACTIVE_NODE_BACKUP=""
+    ACTIVE_NODE_TRANSACTION_MUTATED=0
     remove_node_transaction_dir || {
         warn "节点事务已提交，但临时目录未能清理：$NODE_TRANSACTION_DIR"
         return 0
@@ -2822,8 +3351,13 @@ restore_node_files() {
     local was_enabled="0"
     local failed=0
 
-    [ -f "$backup_dir/service-running" ] && was_running="$(cat "$backup_dir/service-running")"
-    [ -f "$backup_dir/service-enabled" ] && was_enabled="$(cat "$backup_dir/service-enabled")"
+    if ! validate_node_transaction_backup "$backup_dir"; then
+        err "节点事务备份不完整、不可解析或哈希不匹配，已拒绝覆盖现有节点文件。"
+        err "事务备份已保留：$backup_dir"
+        return 1
+    fi
+    was_running="$(cat "$backup_dir/service-running")" || return 1
+    was_enabled="$(cat "$backup_dir/service-enabled")" || return 1
 
     warn "操作未完成，正在恢复操作前的节点配置..."
     service_stop 2>/dev/null || true
@@ -2880,10 +3414,16 @@ rollback_node_files_transaction() {
     [ -n "$transaction_dir" ] || return 0
     node_transaction_dir_valid "$transaction_dir" || return 1
     [ -f "$transaction_dir/pending" ] || return 1
+    if [ "${ACTIVE_NODE_TRANSACTION_MUTATED:-0}" = "0" ] &&
+        [ ! -e "$transaction_dir/mutated" ]; then
+        cancel_unmodified_node_transaction
+        return $?
+    fi
     if ! restore_node_files "$transaction_dir/backup"; then
         return 1
     fi
     ACTIVE_NODE_BACKUP=""
+    ACTIVE_NODE_TRANSACTION_MUTATED=0
     remove_node_transaction_dir "$transaction_dir"
 }
 
@@ -2893,9 +3433,15 @@ rollback_active_node_transaction() {
 
     [ -n "$transaction_dir" ] || return 0
     node_transaction_dir_valid "$transaction_dir" || return 1
+    if [ "${ACTIVE_NODE_TRANSACTION_MUTATED:-0}" = "0" ] &&
+        [ ! -e "$transaction_dir/mutated" ]; then
+        cancel_unmodified_node_transaction
+        return $?
+    fi
     [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ] && had_firewall_transition=1
     if ! restore_node_files "$transaction_dir/backup"; then
         ACTIVE_NODE_BACKUP=""
+        ACTIVE_NODE_TRANSACTION_MUTATED=0
         return 1
     fi
     if [ "$had_firewall_transition" -eq 1 ] &&
@@ -2911,6 +3457,7 @@ rollback_active_node_transaction() {
         }
     fi
     ACTIVE_NODE_BACKUP=""
+    ACTIVE_NODE_TRANSACTION_MUTATED=0
     if [ "$failed" -ne 0 ]; then
         err "节点文件已恢复，但事务未完整结束；备份已保留：$transaction_dir"
         return 1
@@ -2948,47 +3495,85 @@ recover_pending_node_transaction() {
         remove_node_transaction_dir
         return
     fi
+    if [ ! -e "$NODE_TRANSACTION_DIR/mutated" ]; then
+        # pending 已持久化但还没有首次真实修改时，硬中断只需丢弃备份。
+        remove_node_transaction_dir
+        return
+    fi
+    node_file_is_secure "$NODE_TRANSACTION_DIR/mutated" || {
+        err "节点事务 mutated 标记不安全，已拒绝自动恢复。"
+        return 1
+    }
     [ -d "$NODE_TRANSACTION_BACKUP" ] && [ ! -L "$NODE_TRANSACTION_BACKUP" ] || {
         err "待恢复节点事务缺少可信备份，已拒绝启动。"
         return 1
     }
     warn "检测到上次未提交的节点事务，正在优先恢复..."
     ACTIVE_NODE_BACKUP="$NODE_TRANSACTION_DIR"
+    ACTIVE_NODE_TRANSACTION_MUTATED=1
     if ! restore_node_files "$NODE_TRANSACTION_BACKUP"; then
         ACTIVE_NODE_BACKUP=""
+        ACTIVE_NODE_TRANSACTION_MUTATED=0
         err "未提交节点事务恢复失败，备份已保留；修复前禁止继续覆盖节点文件。"
         return 1
     fi
     if declare -F firewall_refresh_if_enabled >/dev/null 2>&1 &&
         ! firewall_refresh_if_enabled; then
         ACTIVE_NODE_BACKUP=""
+        ACTIVE_NODE_TRANSACTION_MUTATED=0
         err "原节点已恢复，但主机防火墙同步失败；事务备份已保留。"
         return 1
     fi
     ACTIVE_NODE_BACKUP=""
+    ACTIVE_NODE_TRANSACTION_MUTATED=0
     remove_node_transaction_dir || return 1
     info "未提交节点事务已完整恢复。"
 }
 
 port_in_use_tcp() {
-    local port="$1"
-    ss -H -ltn 2>/dev/null |
+    local port="$1" output
+
+    command -v ss >/dev/null 2>&1 || return 2
+    output="$(ss -H -ltn 2>/dev/null)" || return 2
+    printf '%s\n' "$output" |
         awk -v port="$port" '$4 ~ ("[:.]" port "$") { found=1 } END { exit !found }'
 }
 
 port_in_use_udp() {
-    local port="$1"
-    ss -H -lun 2>/dev/null |
+    local port="$1" output
+
+    command -v ss >/dev/null 2>&1 || return 2
+    output="$(ss -H -lun 2>/dev/null)" || return 2
+    printf '%s\n' "$output" |
         awk -v port="$port" '$4 ~ ("[:.]" port "$") { found=1 } END { exit !found }'
 }
 
 port_in_use_for_protocols() {
     local port="$1" protocols="${2:-both}"
+    local tcp_status udp_status
 
     case "$protocols" in
         tcp) port_in_use_tcp "$port" ;;
         udp) port_in_use_udp "$port" ;;
-        both) port_in_use_tcp "$port" || port_in_use_udp "$port" ;;
+        both)
+            if port_in_use_tcp "$port"; then
+                tcp_status=0
+            else
+                tcp_status=$?
+            fi
+            if port_in_use_udp "$port"; then
+                udp_status=0
+            else
+                udp_status=$?
+            fi
+            if [ "$tcp_status" -eq 0 ] || [ "$udp_status" -eq 0 ]; then
+                return 0
+            fi
+            if [ "$tcp_status" -gt 1 ] || [ "$udp_status" -gt 1 ]; then
+                return 2
+            fi
+            return 1
+            ;;
         *) return 2 ;;
     esac
 }
@@ -3058,7 +3643,16 @@ listen_mode() {
 
 random_port() {
     local port docker_ports protocols="${2:-both}" reserved_node_ports="${3:-}"
-    local i
+    local i status
+
+    command -v ss >/dev/null 2>&1 || {
+        err "缺少 ss，无法可靠检查节点端口占用。"
+        return 1
+    }
+    if ! ssh_effective_ports_csv >/dev/null 2>&1; then
+        err "无法读取 SSH 当前生效端口，已取消随机端口选择。"
+        return 1
+    fi
     if [ "$#" -ge 1 ]; then
         docker_ports="$1"
     else
@@ -3069,9 +3663,25 @@ random_port() {
     fi
     for i in $(seq 1 100); do
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if ! port_in_use_for_protocols "$port" "$protocols" &&
-            ! port_is_effective_ssh_port "$port" &&
-            ! csv_contains_port "$docker_ports" "$port" &&
+        if port_in_use_for_protocols "$port" "$protocols"; then
+            continue
+        else
+            status=$?
+            [ "$status" -eq 1 ] || {
+                err "无法检查端口 $port 的监听状态，已取消随机端口选择。"
+                return 1
+            }
+        fi
+        if port_is_effective_ssh_port "$port"; then
+            continue
+        else
+            status=$?
+            [ "$status" -eq 1 ] || {
+                err "无法读取 SSH 当前生效端口，已取消随机端口选择。"
+                return 1
+            }
+        fi
+        if ! csv_contains_port "$docker_ports" "$port" &&
             ! csv_contains_port "$reserved_node_ports" "$port"; then
             echo "$port"
             return 0
@@ -3082,14 +3692,26 @@ random_port() {
 }
 
 random_trace_source_port() {
-    local port i
+    local port i status
+
+    command -v ss >/dev/null 2>&1 || {
+        err "缺少 ss，无法可靠选择 TCP 探测源端口。"
+        return 1
+    }
 
     # 探测源端口不是入站服务端口，不应依赖 Docker daemon 的保留端口清单。
     for i in $(seq 1 100); do
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if ! port_in_use_tcp "$port"; then
-            echo "$port"
-            return 0
+        if port_in_use_tcp "$port"; then
+            continue
+        else
+            status=$?
+            if [ "$status" -eq 1 ]; then
+                echo "$port"
+                return 0
+            fi
+            err "无法检查 TCP 端口 $port，已取消探测源端口选择。"
+            return 1
         fi
     done
     err "连续 100 次未找到可用的 TCP 探测源端口。"
@@ -3117,7 +3739,8 @@ is_valid_port() {
 
 port_is_effective_ssh_port() {
     local port="$1" ports
-    ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
+
+    ports="$(ssh_effective_ports_csv 2>/dev/null)" || return 2
     case ",$ports," in
         *",$port,"*) return 0 ;;
         *) return 1 ;;
@@ -3127,7 +3750,16 @@ port_is_effective_ssh_port() {
 choose_node_port() {
     local existing_port="${1:-}" protocols="${2:-both}" existing_protocols="${3:-}"
     local reserved_node_ports="${4:-}"
-    local input confirm docker_ports managed_pids
+    local input confirm docker_ports managed_pids status
+
+    command -v ss >/dev/null 2>&1 || {
+        err "缺少 ss，无法可靠检查节点端口占用。"
+        return 1
+    }
+    ssh_effective_ports_csv >/dev/null 2>&1 || {
+        err "无法读取 SSH 当前生效端口，已取消节点端口选择。"
+        return 1
+    }
 
     docker_ports="$(docker_reserved_ports_for_port_choice "$protocols")" || {
         err "无法可靠读取 Docker 已发布端口，已取消节点端口选择。"
@@ -3152,22 +3784,41 @@ choose_node_port() {
         if port_is_effective_ssh_port "$input"; then
             err "端口 $input 是当前 SSH 生效端口，不能用于节点。"
             continue
+        else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+                err "无法读取 SSH 当前生效端口，已取消节点端口选择。"
+                return 1
+            fi
         fi
         if csv_contains_port "$reserved_node_ports" "$input"; then
             err "端口 $input 已被另一个节点使用，请更换。"
             continue
         fi
         managed_pids="$(singbox_config_pids || true)"
-        if { [ "$input" = "$existing_port" ] &&
-            { { [ -n "$managed_pids" ] &&
-                port_conflicts_with_existing_node "$input" "$protocols" "$existing_protocols"; } ||
-              { [ -z "$managed_pids" ] &&
-                port_in_use_for_protocols "$input" "$protocols"; }; }; } ||
-            { [ "$input" != "$existing_port" ] &&
-                port_in_use_for_protocols "$input" "$protocols"; }; then
-            err "端口 $input 已被占用，请更换。"
-            continue
+        status=1
+        if [ "$input" = "$existing_port" ] && [ -n "$managed_pids" ]; then
+            if port_conflicts_with_existing_node "$input" "$protocols" "$existing_protocols"; then
+                status=0
+            else
+                status=$?
+            fi
+        elif port_in_use_for_protocols "$input" "$protocols"; then
+            status=0
+        else
+            status=$?
         fi
+        case "$status" in
+            0)
+                err "端口 $input 已被占用，请更换。"
+                continue
+                ;;
+            1) ;;
+            *)
+                err "无法检查端口 $input 的监听状态，已取消节点端口选择。"
+                return 1
+                ;;
+        esac
         if csv_contains_port "$docker_ports" "$input"; then
             err "端口 $input 已被 Docker 发布规则占用，请更换。"
             continue
@@ -3706,7 +4357,7 @@ EOF
         err "无法创建受保护的节点事务，未修改 Shadowsocks 节点。"
         return 1
     fi
-    if ! install_singbox_if_missing; then
+    if ! install_singbox_for_node_transaction; then
         rollback_node_files_transaction || true
         err "sing-box 安装失败，未创建 Shadowsocks 节点。"
         return 1
@@ -3735,7 +4386,8 @@ EOF
         err "Shadowsocks 配置、状态或链接预生成校验失败，未修改现有节点。"
         return 1
     fi
-    if ! firewall_prepare_port_transition "$port" "$port"; then
+    if ! mark_node_transaction_mutated ||
+        ! firewall_prepare_port_transition "$port" "$port"; then
         rollback_active_node_transaction || true
         err "主机防火墙无法临时放行新节点端口，未创建 Shadowsocks 节点。"
         return 1
@@ -3862,7 +4514,7 @@ EOF
         err "无法创建受保护的节点事务，未修改 VLESS Reality 节点。"
         return 1
     fi
-    if ! install_singbox_if_missing; then
+    if ! install_singbox_for_node_transaction; then
         rollback_node_files_transaction || true
         err "sing-box 安装失败，未创建 VLESS Reality 节点。"
         return 1
@@ -3917,7 +4569,8 @@ EOF
         err "VLESS Reality 配置、状态或链接预生成校验失败，未修改现有节点。"
         return 1
     fi
-    if ! firewall_prepare_port_transition "$port" ""; then
+    if ! mark_node_transaction_mutated ||
+        ! firewall_prepare_port_transition "$port" ""; then
         rollback_active_node_transaction || true
         err "主机防火墙无法临时放行新节点端口，未创建 VLESS Reality 节点。"
         return 1
@@ -4009,7 +4662,7 @@ EOF
 
 delete_node_protocol() {
     local protocol="$1" label config state uri node_port node_protocols
-    local confirm
+    local confirm port_status
 
     case "$protocol" in
         vless) label="VLESS Reality"; node_protocols=tcp ;;
@@ -4036,7 +4689,8 @@ delete_node_protocol() {
         err "备份当前节点失败，已取消删除。"
         return 1
     fi
-    if ! firewall_prepare_port_transition "" ""; then
+    if ! mark_node_transaction_mutated ||
+        ! firewall_prepare_port_transition "" ""; then
         rollback_active_node_transaction || true
         err "主机防火墙无法开始节点删除事务，已取消删除。"
         return 1
@@ -4059,6 +4713,13 @@ delete_node_protocol() {
         rollback_active_node_transaction || true
         err "节点端口 $node_port 仍被其他进程监听，已保留节点配置。"
         return 1
+    else
+        port_status=$?
+        if [ "$port_status" -ne 1 ]; then
+            rollback_active_node_transaction || true
+            err "无法确认节点端口 $node_port 是否已释放，已保留节点配置。"
+            return 1
+        fi
     fi
 
     config="$(node_config_path "$protocol")" || return 1
@@ -4119,6 +4780,192 @@ delete_node() {
     delete_node_protocol ss
 }
 
+singbox_binary_version_at() {
+    local binary="$1"
+
+    [ -x "$binary" ] && [ ! -L "$binary" ] || return 1
+    "$binary" version 2>/dev/null | head -n1 | sed 's/^sing-box version //'
+}
+
+restore_singbox_binary_atomically() {
+    local backup_binary="$1" binary_path="$2" old_version="$3"
+    local parent tmp restored_version
+
+    [ -f "$backup_binary" ] && [ ! -L "$backup_binary" ] || return 1
+    parent="$(dirname "$binary_path")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    tmp="$(mktemp "$parent/.sing-box-vpsbox-restore.XXXXXX")" || return 1
+    if ! cp -a -- "$backup_binary" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    restored_version="$(singbox_binary_version_at "$tmp" 2>/dev/null || true)"
+    if [ -n "$old_version" ] && [ "$restored_version" != "$old_version" ]; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$binary_path"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+singbox_update_transaction_dir_valid() {
+    [ "${1:-}" = "$SINGBOX_UPDATE_TRANSACTION_DIR" ] &&
+        [ "$SINGBOX_UPDATE_TRANSACTION_DIR" = "$VPSBOX_STATE_DIR/singbox-update" ]
+}
+
+remove_singbox_update_transaction_dir() {
+    local dir="${1:-$SINGBOX_UPDATE_TRANSACTION_DIR}"
+
+    singbox_update_transaction_dir_valid "$dir" || return 1
+    [ ! -L "$dir" ] || return 1
+    rm -rf -- "$dir"
+}
+
+singbox_update_state_value() {
+    local key="$1"
+
+    [ -f "$SINGBOX_UPDATE_TRANSACTION_STATE" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_STATE" ] || return 1
+    awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); found=1; exit }
+        END { if (!found) exit 1 }' "$SINGBOX_UPDATE_TRANSACTION_STATE"
+}
+
+singbox_update_transaction_valid() {
+    local binary_path old_version was_enabled was_active package_name
+    local binary_hash package_hash current_hash mode
+
+    singbox_update_transaction_dir_valid "$SINGBOX_UPDATE_TRANSACTION_DIR" || return 1
+    [ -d "$SINGBOX_UPDATE_TRANSACTION_DIR" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 1
+    [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] || return 1
+    [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ] || return 1
+    mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR" 2>/dev/null || true)"
+    [ "$mode" = "700" ] || return 1
+    mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_STATE" 2>/dev/null || true)"
+    [ "$mode" = "600" ] || return 1
+    if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
+        [ "$(stat -c '%U:%G' "$SINGBOX_UPDATE_TRANSACTION_DIR" "$SINGBOX_UPDATE_TRANSACTION_STATE" \
+            "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" \
+            2>/dev/null | sort -u)" = "root:root" ] || return 1
+    fi
+    mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" 2>/dev/null || true)"
+    [ "$mode" = "600" ] || return 1
+    mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" 2>/dev/null || true)"
+    [ "$mode" = "755" ] || return 1
+
+    [ "$(singbox_update_state_value version 2>/dev/null || true)" = "1" ] || return 1
+    binary_path="$(singbox_update_state_value binary_path 2>/dev/null || true)"
+    old_version="$(singbox_update_state_value old_version 2>/dev/null || true)"
+    was_enabled="$(singbox_update_state_value was_enabled 2>/dev/null || true)"
+    was_active="$(singbox_update_state_value was_active 2>/dev/null || true)"
+    package_name="$(singbox_update_state_value package_name 2>/dev/null || true)"
+    binary_hash="$(singbox_update_state_value binary_sha256 2>/dev/null || true)"
+    package_hash="$(singbox_update_state_value package_sha256 2>/dev/null || true)"
+    if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
+        [[ "$binary_path" == /tmp/vpsbox-test.*/sing-box ||
+            "$binary_path" == /tmp/vpsbox-test.*/*/sing-box ]] || return 1
+    else
+        case "$binary_path" in
+            /usr/bin/sing-box|/usr/local/bin/sing-box) ;;
+            *) return 1 ;;
+        esac
+    fi
+    [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || return 1
+    [[ "$was_enabled" =~ ^[01]$ && "$was_active" =~ ^[01]$ ]] || return 1
+    [[ "$binary_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+    current_hash="$(sha256sum "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" 2>/dev/null | awk '{print $1}')"
+    [ "$current_hash" = "$binary_hash" ] || return 1
+    [ "$(singbox_binary_version_at "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" 2>/dev/null || true)" = "$old_version" ] ||
+        return 1
+    case "$package_name" in
+        rollback-package.deb|rollback-package.apk|rollback-package.rpm)
+            [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" ] &&
+                [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" ] || return 1
+            if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
+                [ "$(stat -c '%U:%G %a' "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null || true)" = "root:root 600" ] ||
+                    return 1
+            else
+                [ "$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null || true)" = "600" ] ||
+                    return 1
+            fi
+            [[ "$package_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+            current_hash="$(sha256sum "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null | awk '{print $1}')"
+            [ "$current_hash" = "$package_hash" ]
+            ;;
+        none)
+            [ "$package_hash" = "none" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+persist_singbox_update_transaction() {
+    local binary_path="$1" backup_binary="$2" rollback_package="$3" old_version="$4"
+    local was_enabled="$5" was_active="$6" package_name package_hash="none"
+    local binary_hash tmp_dir
+
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    [ ! -L "$VPSBOX_STATE_DIR" ] && [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 1
+    mkdir -p "$VPSBOX_STATE_DIR" || return 1
+    if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
+        chown root:root "$VPSBOX_STATE_DIR" || return 1
+    fi
+    chmod 700 "$VPSBOX_STATE_DIR" || return 1
+    if [ -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ]; then
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] || return 1
+        remove_singbox_update_transaction_dir || return 1
+    fi
+    tmp_dir="$(mktemp -d "$VPSBOX_STATE_DIR/.singbox-update.XXXXXX")" || return 1
+    chmod 700 "$tmp_dir" || { rm -rf -- "$tmp_dir"; return 1; }
+    if ! cp -a -- "$backup_binary" "$tmp_dir/old-binary" ||
+        ! chmod 755 "$tmp_dir/old-binary"; then
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    binary_hash="$(sha256sum "$tmp_dir/old-binary" | awk '{print $1}')"
+    if [ -n "$rollback_package" ]; then
+        case "$rollback_package" in
+            *.deb) package_name="rollback-package.deb" ;;
+            *.apk) package_name="rollback-package.apk" ;;
+            *.rpm) package_name="rollback-package.rpm" ;;
+            *) rm -rf -- "$tmp_dir"; return 1 ;;
+        esac
+        if ! cp -a -- "$rollback_package" "$tmp_dir/$package_name" ||
+            ! chmod 600 "$tmp_dir/$package_name"; then
+            rm -rf -- "$tmp_dir"
+            return 1
+        fi
+        package_hash="$(sha256sum "$tmp_dir/$package_name" | awk '{print $1}')"
+    else
+        package_name=none
+    fi
+    if ! {
+        printf 'version=1\n'
+        printf 'binary_path=%s\n' "$binary_path"
+        printf 'old_version=%s\n' "$old_version"
+        printf 'was_enabled=%s\n' "$was_enabled"
+        printf 'was_active=%s\n' "$was_active"
+        printf 'package_name=%s\n' "$package_name"
+        printf 'binary_sha256=%s\n' "$binary_hash"
+        printf 'package_sha256=%s\n' "$package_hash"
+    } > "$tmp_dir/state" ||
+        ! chmod 600 "$tmp_dir/state" ||
+        ! : > "$tmp_dir/pending" ||
+        ! chmod 600 "$tmp_dir/pending" ||
+        ! mv -- "$tmp_dir" "$SINGBOX_UPDATE_TRANSACTION_DIR"; then
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
+    if ! sync_node_transaction_store || ! singbox_update_transaction_valid; then
+        remove_singbox_update_transaction_dir || true
+        return 1
+    fi
+}
+
 restore_singbox_update_backup() {
     local binary_path="$1" backup_binary="$2" backup_dir="$3"
     local was_enabled="$4" was_active="$5"
@@ -4148,7 +4995,7 @@ restore_singbox_update_backup() {
         fi
     fi
     if [ "$package_restored" -eq 0 ]; then
-        if cp -a -- "$backup_binary" "$binary_path"; then
+        if restore_singbox_binary_atomically "$backup_binary" "$binary_path" "$old_version"; then
             binary_ready=1
         else
             err "旧 sing-box 二进制恢复失败：$backup_binary"
@@ -4167,9 +5014,53 @@ restore_singbox_update_backup() {
         failed=1
     fi
 
-    # 更新失败时保留本地二进制备份，避免包管理器处于异常状态后失去最后恢复副本。
-    warn "sing-box 更新备份已保留：$backup_dir"
-    [ "$failed" -eq 0 ]
+    if [ "$failed" -ne 0 ]; then
+        # 更新失败时保留本地二进制备份，避免包管理器处于异常状态后失去最后恢复副本。
+        warn "sing-box 更新备份已保留：$backup_dir"
+        return 1
+    fi
+    return 0
+}
+
+recover_pending_singbox_update() {
+    local binary_path old_version was_enabled was_active package_name rollback_package=""
+
+    [ -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 0
+    [ -d "$SINGBOX_UPDATE_TRANSACTION_DIR" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || {
+            err "sing-box 更新事务路径不安全，已拒绝自动处理。"
+            return 1
+        }
+    if [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ]; then
+        remove_singbox_update_transaction_dir || return 1
+        return 0
+    fi
+    singbox_update_transaction_valid || {
+        err "sing-box 更新恢复记录未通过完整性检查，已保留：$SINGBOX_UPDATE_TRANSACTION_DIR"
+        return 1
+    }
+    binary_path="$(singbox_update_state_value binary_path)"
+    old_version="$(singbox_update_state_value old_version)"
+    was_enabled="$(singbox_update_state_value was_enabled)"
+    was_active="$(singbox_update_state_value was_active)"
+    package_name="$(singbox_update_state_value package_name)"
+    [ "$package_name" = "none" ] ||
+        rollback_package="$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name"
+
+    warn "检测到上次未完成的 sing-box 更新，正在恢复旧版本。"
+    if ! restore_singbox_update_backup \
+        "$binary_path" "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" \
+        "$SINGBOX_UPDATE_TRANSACTION_DIR" "$was_enabled" "$was_active" \
+        "$rollback_package" "$old_version"; then
+        err "sing-box 旧版本未能完整恢复，事务记录已保留：$SINGBOX_UPDATE_TRANSACTION_DIR"
+        return 1
+    fi
+    [ "$(singbox_version)" = "$old_version" ] || {
+        err "sing-box 恢复后的版本不符，事务记录已保留：$SINGBOX_UPDATE_TRANSACTION_DIR"
+        return 1
+    }
+    remove_singbox_update_transaction_dir || return 1
+    info "上次中断的 sing-box 更新已恢复到 v$old_version。"
 }
 
 begin_singbox_update_transaction() {
@@ -4195,9 +5086,14 @@ cancel_unmodified_singbox_update_transaction() {
     ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
     if { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
+        singbox_update_transaction_dir_valid "$backup_dir" ||
         [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
         [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ]; then
-        rm -rf -- "$backup_dir"
+        if singbox_update_transaction_dir_valid "$backup_dir"; then
+            remove_singbox_update_transaction_dir
+        else
+            rm -rf -- "$backup_dir"
+        fi
     fi
 }
 
@@ -4230,10 +5126,18 @@ rollback_active_singbox_update() {
         restore_singbox_update_backup \
             "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" \
             "$rollback_package" "$old_version" || result=1
+        if [ "$result" -eq 0 ] && singbox_update_transaction_dir_valid "$backup_dir"; then
+            remove_singbox_update_transaction_dir || result=1
+        fi
     elif { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
+        singbox_update_transaction_dir_valid "$backup_dir" ||
         [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
         [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ]; then
-        rm -rf -- "$backup_dir" || result=1
+        if singbox_update_transaction_dir_valid "$backup_dir"; then
+            remove_singbox_update_transaction_dir || result=1
+        else
+            rm -rf -- "$backup_dir" || result=1
+        fi
     else
         result=1
     fi
@@ -4253,9 +5157,14 @@ commit_singbox_update_transaction() {
     ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
     { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
+        singbox_update_transaction_dir_valid "$backup_dir" ||
         [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
         [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
-    rm -rf -- "$backup_dir"
+    if singbox_update_transaction_dir_valid "$backup_dir"; then
+        remove_singbox_update_transaction_dir
+    else
+        rm -rf -- "$backup_dir"
+    fi
 }
 
 update_singbox() {
@@ -4328,6 +5237,20 @@ update_singbox() {
     }
     ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
     ACTIVE_SINGBOX_UPDATE_OLD_VERSION="$old_version"
+    if ! persist_singbox_update_transaction \
+        "$binary_path" "$backup_binary" "$rollback_package" "$old_version" \
+        "$was_enabled" "$was_active"; then
+        cancel_unmodified_singbox_update_transaction
+        err "无法持久化 sing-box 更新回滚记录，已取消更新。"
+        return 1
+    fi
+    rm -rf -- "$backup_dir"
+    backup_dir="$SINGBOX_UPDATE_TRANSACTION_DIR"
+    backup_binary="$backup_dir/old-binary"
+    rollback_package="$backup_dir/$(singbox_update_state_value package_name)"
+    ACTIVE_SINGBOX_UPDATE_DIR="$backup_dir"
+    ACTIVE_SINGBOX_UPDATE_BACKUP="$backup_binary"
+    ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
     info "正在更新 sing-box..."
     ACTIVE_SINGBOX_UPDATE_MUTATED=1
     if ! run_singbox_installer; then
@@ -5867,7 +6790,7 @@ print_ipv4_dns_from_resolvectl() {
 }
 
 print_ipv4_dns_from_resolv_conf() {
-    [ -r /etc/resolv.conf ] || return 1
+    [ -r "$RESOLV_CONF" ] || return 1
 
     local found=1
     local seen=" "
@@ -5886,16 +6809,16 @@ print_ipv4_dns_from_resolv_conf() {
                     ;;
             esac
         fi
-    done < /etc/resolv.conf
+    done < "$RESOLV_CONF"
 
     return "$found"
 }
 
 resolv_conf_managed_by_systemd_resolved() {
-    [ -L /etc/resolv.conf ] || return 1
+    [ -L "$RESOLV_CONF" ] || return 1
 
     local target
-    target="$(readlink /etc/resolv.conf 2>/dev/null || true)"
+    target="$(readlink "$RESOLV_CONF" 2>/dev/null || true)"
 
     case "$target" in
         *systemd/resolve*)
@@ -5945,21 +6868,16 @@ dns_values_line() {
 }
 
 verify_dns_resolution() {
+    local output
+
     if command -v getent >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 8 getent ahosts example.com 2>/dev/null | grep -Eq '^[0-9A-Fa-f:.]+'
-        else
-            getent ahosts example.com 2>/dev/null | grep -Eq '^[0-9A-Fa-f:.]+'
-        fi
-        return $?
+        output="$(run_bounded_command 8 getent ahosts example.com 2>/dev/null)" || return 1
+        grep -Eq '^[0-9A-Fa-f:.]+' <<< "$output"
+        return
     fi
     if command -v resolvectl >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 8 resolvectl query example.com >/dev/null 2>&1
-        else
-            resolvectl query example.com >/dev/null 2>&1
-        fi
-        return $?
+        run_bounded_command 8 resolvectl query example.com >/dev/null 2>&1
+        return
     fi
     return 2
 }
@@ -5972,11 +6890,11 @@ write_resolv_conf_dns() {
     local verify_status
     local tmp
 
-    backup_change_file_once DNS_RESOLV /etc/resolv.conf || { err "记录 DNS 原配置失败，已取消修改。"; return 1; }
-    backup="/etc/resolv.conf.vpsbox.bak.$(date +%Y%m%d%H%M%S)"
-    if [ -e /etc/resolv.conf ]; then
-        if ! cp -a /etc/resolv.conf "$backup"; then
-            err "备份 /etc/resolv.conf 失败，已取消 DNS 修改。"
+    backup_change_file_once DNS_RESOLV "$RESOLV_CONF" || { err "记录 DNS 原配置失败，已取消修改。"; return 1; }
+    backup="${RESOLV_CONF}.vpsbox.bak.$(date +%Y%m%d%H%M%S)"
+    if [ -e "$RESOLV_CONF" ]; then
+        if ! cp -a "$RESOLV_CONF" "$backup"; then
+            err "备份 $RESOLV_CONF 失败，已取消 DNS 修改。"
             return 1
         fi
     else
@@ -5984,22 +6902,27 @@ write_resolv_conf_dns() {
     fi
     begin_change_transaction DNS_RESOLV || { err "记录 DNS 修改事务失败，已取消修改。"; return 1; }
 
-    tmp="$(mktemp /etc/.resolv.conf.vpsbox.XXXXXX)" || return 1
+    tmp="$(mktemp "$(dirname "$RESOLV_CONF")/.resolv.conf.vpsbox.XXXXXX")" || return 1
     if ! {
         printf 'nameserver %s\n' "$dns1"
-        [ -n "$dns2" ] && printf 'nameserver %s\n' "$dns2"
-        [ -r /etc/resolv.conf ] && awk '$1 != "nameserver" { print }' /etc/resolv.conf
+        if [ -n "$dns2" ]; then
+            printf 'nameserver %s\n' "$dns2"
+        fi
+        if [ -r "$RESOLV_CONF" ]; then
+            awk '$1 != "nameserver" { print }' "$RESOLV_CONF"
+        fi
+        :
     } > "$tmp"; then
         rm -f "$tmp"
-        err "生成新的 /etc/resolv.conf 失败。"
+        err "生成新的 $RESOLV_CONF 失败。"
         return 1
     fi
 
     chown root:root "$tmp" || { rm -f "$tmp"; return 1; }
     chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
-    if ! mv -f "$tmp" /etc/resolv.conf; then
+    if ! mv -f "$tmp" "$RESOLV_CONF"; then
         rm -f "$tmp"
-        err "原子替换 /etc/resolv.conf 失败。"
+        err "原子替换 $RESOLV_CONF 失败。"
         return 1
     fi
 
@@ -6012,16 +6935,19 @@ write_resolv_conf_dns() {
         else
             err "DNS 解析验证失败，正在恢复原配置。"
             if [ -e "$backup" ]; then
-                cp -a "$backup" /etc/resolv.conf || warn "恢复 DNS 备份失败：$backup"
+                cp -a "$backup" "$RESOLV_CONF" || warn "恢复 DNS 备份失败：$backup"
             elif [ "$created_resolv" = "1" ]; then
-                rm -f /etc/resolv.conf
+                rm -f "$RESOLV_CONF"
             fi
             return 1
         fi
     fi
 
     mark_change_applied DNS_RESOLV || return 1
-    [ -e "$backup" ] && info "原配置备份：$backup"
+    if [ -e "$backup" ]; then
+        info "原配置备份：$backup"
+    fi
+    return 0
 }
 
 rollback_systemd_resolved_dns() {
@@ -6110,7 +7036,10 @@ EOF
         fi
     fi
     mark_change_applied DNS_RESOLVED || return 1
-    [ -n "$backup" ] && [ -e "$backup" ] && info "原配置备份：$backup"
+    if [ -n "$backup" ] && [ -e "$backup" ]; then
+        info "原配置备份：$backup"
+    fi
+    return 0
 }
 
 apply_ipv4_dns() {
@@ -6122,8 +7051,8 @@ apply_ipv4_dns() {
         return $?
     fi
 
-    if [ -L /etc/resolv.conf ]; then
-        warn "/etc/resolv.conf 是未知符号链接，DNS 可能由系统网络服务管理。"
+    if [ -L "$RESOLV_CONF" ]; then
+        warn "$RESOLV_CONF 是未知符号链接，DNS 可能由系统网络服务管理。"
         warn "为避免破坏 NetworkManager、DHCP 或 cloud-init 管理的 DNS，已拒绝直接覆盖。"
         return 2
     fi
@@ -6343,23 +7272,75 @@ sshd_main_has_active_port_directive() {
 }
 
 sshd_dropin_include_available() {
-    grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/.*\.conf' "$SSHD_MAIN_CONF" 2>/dev/null
+    sshd_vpsbox_port_include_available &&
+        sshd_vpsbox_hardening_include_available
+}
+
+sshd_vpsbox_port_include_available() {
+    sshd_main_has_dropin_wildcard ||
+        sshd_main_includes_path "$SSHD_VPSBOX_PORT_CONF"
+}
+
+sshd_vpsbox_hardening_include_available() {
+    sshd_main_has_dropin_wildcard ||
+        sshd_main_includes_path "$SSHD_VPSBOX_HARDENING_CONF"
+}
+
+sshd_main_has_dropin_wildcard() {
+    awk '
+        tolower($1) == "include" {
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /sshd_config[.]d\/[*][.]conf$/) found = 1
+            }
+        }
+        END { exit !found }
+    ' "$SSHD_MAIN_CONF" 2>/dev/null
+}
+
+sshd_main_includes_path() {
+    local expected="$1"
+
+    awk -v expected="$expected" '
+        tolower($1) == "include" {
+            for (i = 2; i <= NF; i++) {
+                if ($i == expected) found = 1
+            }
+        }
+        END { exit !found }
+    ' "$SSHD_MAIN_CONF" 2>/dev/null
+}
+
+install_ssh_config_atomically() {
+    install_root_file_atomically "$@"
 }
 
 ensure_sshd_dropin_include() {
     local tmp
+    local -a managed_includes=()
 
     sshd_dropin_include_available && return 0
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
     tmp="$(mktemp)" || return 1
+    sshd_main_includes_path "$SSHD_VPSBOX_PORT_CONF" ||
+        managed_includes+=("$SSHD_VPSBOX_PORT_CONF")
+    sshd_main_includes_path "$SSHD_VPSBOX_HARDENING_CONF" ||
+        managed_includes+=("$SSHD_VPSBOX_HARDENING_CONF")
+    [ "${#managed_includes[@]}" -gt 0 ] || {
+        rm -f "$tmp"
+        return 1
+    }
 
     # OpenSSH 对多数全局指令采用首个匹配值，因此 Include 必须位于主配置前部。
+    # 主配置原本没有通配 Include 时只引入 vpsbox 自己的两个文件，避免顺带
+    # 激活目录中由云镜像或管理员留下的其他休眠 drop-in。
     {
-        printf 'Include %s/*.conf\n' "$SSHD_CONFIG_DIR"
+        printf 'Include'
+        printf ' %s' "${managed_includes[@]}"
+        printf '\n'
         cat "$SSHD_MAIN_CONF"
     } > "$tmp" || { rm -f "$tmp"; return 1; }
 
-    if ! cat "$tmp" > "$SSHD_MAIN_CONF"; then
+    if ! install_ssh_config_atomically "$tmp" "$SSHD_MAIN_CONF" 644; then
         rm -f "$tmp"
         return 1
     fi
@@ -6381,16 +7362,18 @@ restore_ssh_config_backup() {
     local main_backup="$1"
     local dropin_path="$2"
     local dropin_backup="$3"
-    local failed=0
+    local failed=0 mode
 
     if [ -n "$main_backup" ] && [ -e "$main_backup" ]; then
-        cp -a "$main_backup" "$SSHD_MAIN_CONF" || {
+        mode="$(stat -c '%a' "$main_backup" 2>/dev/null || true)"
+        install_ssh_config_atomically "$main_backup" "$SSHD_MAIN_CONF" "$mode" || {
             warn "恢复 $SSHD_MAIN_CONF 失败。"
             failed=1
         }
     fi
     if [ -n "$dropin_backup" ] && [ -e "$dropin_backup" ]; then
-        cp -a "$dropin_backup" "$dropin_path" || {
+        mode="$(stat -c '%a' "$dropin_backup" 2>/dev/null || true)"
+        install_ssh_config_atomically "$dropin_backup" "$dropin_path" "$mode" || {
             warn "恢复 $dropin_path 失败。"
             failed=1
         }
@@ -6418,7 +7401,8 @@ set_main_ssh_port_directives() {
             if (!changed) print "Port " port
         }
     ' "$SSHD_MAIN_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
-    install -m 644 "$tmp" "$SSHD_MAIN_CONF" || { rm -f "$tmp"; return 1; }
+    install_ssh_config_atomically "$tmp" "$SSHD_MAIN_CONF" 644 ||
+        { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
 
@@ -6431,7 +7415,8 @@ write_vpsbox_ssh_port_config() {
 # Managed by vpsbox
 Port $SSH_TARGET_PORT
 EOF
-    install -m 644 "$tmp" "$SSHD_VPSBOX_PORT_CONF" || { rm -f "$tmp"; return 1; }
+    install_ssh_config_atomically "$tmp" "$SSHD_VPSBOX_PORT_CONF" 644 ||
+        { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
 
@@ -6449,7 +7434,8 @@ PermitEmptyPasswords no
 UsePAM yes
 UseDNS no
 EOF
-    install -m 644 "$tmp" "$SSHD_VPSBOX_HARDENING_CONF" || { rm -f "$tmp"; return 1; }
+    install_ssh_config_atomically "$tmp" "$SSHD_VPSBOX_HARDENING_CONF" 644 ||
+        { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
 
@@ -6642,8 +7628,8 @@ ssh_firewall_transition_reconcile() {
     local configured_ports listening_ports safe_ports transition_dir
 
     [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] || return 0
-    configured_ports="$(ssh_effective_ports_csv 2>/dev/null)" || return 1
-    listening_ports="$(ssh_listening_ports_csv 2>/dev/null)" || return 1
+    configured_ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
+    listening_ports="$(ssh_listening_ports_csv 2>/dev/null || true)"
     safe_ports="$(merge_port_csv "$configured_ports" "$listening_ports")" || return 1
     [ -n "$safe_ports" ] || return 1
     firewall_sync_active_config "$safe_ports" "" 1 || return 1
@@ -6681,8 +7667,30 @@ ssh_socket_activation_active() {
     is_systemd && { systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet sshd.socket 2>/dev/null; }
 }
 
+ssh_socket_activation_enabled_or_active() {
+    local unit
+
+    is_systemd || return 1
+    for unit in ssh.socket sshd.socket; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null ||
+            systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 choose_ssh_target_port() {
-    local input confirm docker_ports
+    local input confirm docker_ports status
+
+    command -v ss >/dev/null 2>&1 || {
+        err "缺少 ss，无法可靠检查 SSH 端口占用。"
+        return 1
+    }
+    ssh_effective_ports_csv >/dev/null 2>&1 || {
+        err "无法读取 SSH 当前生效端口，已取消修改。"
+        return 1
+    }
 
     docker_ports="$(docker_reserved_ports_for_port_choice tcp)" || {
         err "无法可靠读取 Docker 已发布端口，已取消 SSH 端口选择。"
@@ -6693,11 +7701,26 @@ choose_ssh_target_port() {
         read -r -p "请输入新 SSH 端口（1-65535，留空默认 23333）: " input || return 1
         input="${input:-23333}"
         is_valid_port "$input" || { err "端口必须是 1-65535 的整数。"; continue; }
-        if ! port_is_effective_ssh_port "$input" && port_in_use_tcp "$input"; then
-            err "端口 $input 已被占用，请更换。"
-            continue
+        if port_is_effective_ssh_port "$input"; then
+            status=0
+        else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+                err "无法读取 SSH 当前生效端口，已取消修改。"
+                return 1
+            fi
+            if port_in_use_tcp "$input"; then
+                err "端口 $input 已被占用，请更换。"
+                continue
+            else
+                status=$?
+                if [ "$status" -ne 1 ]; then
+                    err "无法检查端口 $input 的监听状态，已取消修改。"
+                    return 1
+                fi
+            fi
         fi
-        if ! port_is_effective_ssh_port "$input" && csv_contains_port "$docker_ports" "$input"; then
+        if [ "$status" -ne 0 ] && csv_contains_port "$docker_ports" "$input"; then
             err "端口 $input 已被 Docker 发布规则占用，请更换。"
             continue
         fi
@@ -6809,10 +7832,15 @@ rollback_ssh_port_change() {
 rollback_ssh_hardening_change() {
     local main_backup="$1" dropin_backup="$2" applied_before="$3"
     local restart_required="${4:-0}"
+    local expected_ports="${5:-}"
 
     restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup" ||
         return 1
     if [ "$restart_required" = "1" ] && ! restart_ssh_service; then
+        return 1
+    fi
+    if [ "$restart_required" = "1" ] && [ -n "$expected_ports" ] &&
+        ! wait_for_any_ssh_listener_csv "$expected_ports"; then
         return 1
     fi
     if [ "$applied_before" != "1" ]; then
@@ -6841,14 +7869,28 @@ warn_ssh_access_controls() {
     fi
 }
 
+restore_fail2ban_sshd_config_file() {
+    local backup="$1"
+    local mode
+
+    if [ -n "$backup" ]; then
+        [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+        mode="$(stat -c '%a' "$backup" 2>/dev/null)" || return 1
+        install_root_file_atomically "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" "$mode"
+    else
+        [ ! -L "$FAIL2BAN_VPSBOX_SSHD_CONF" ] || return 1
+        if [ -e "$FAIL2BAN_VPSBOX_SSHD_CONF" ] &&
+            [ ! -f "$FAIL2BAN_VPSBOX_SSHD_CONF" ]; then
+            return 1
+        fi
+        rm -f -- "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    fi
+}
+
 restore_fail2ban_sshd_sync_state() {
     local backup="$1" was_running="$2"
 
-    if [ -n "$backup" ]; then
-        cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
-    else
-        rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
-    fi
+    restore_fail2ban_sshd_config_file "$backup" || return 1
     fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
 
     if is_systemd; then
@@ -6866,6 +7908,17 @@ restore_fail2ban_sshd_sync_state() {
     else
         return 1
     fi
+}
+
+fail2ban_sync_failure_with_rollback() {
+    local reason="$1" backup="$2" was_running="$3"
+
+    if restore_fail2ban_sshd_sync_state "$backup" "$was_running"; then
+        err "$reason，已恢复同步前的配置与服务状态。"
+    else
+        err "$reason，且同步前状态未能完整恢复，请检查服务与配置。"
+    fi
+    return 1
 }
 
 restore_fail2ban_runtime_after_sync() {
@@ -6922,6 +7975,11 @@ sync_fail2ban_sshd_port() {
     fi
 
     mkdir -p "$FAIL2BAN_CONFIG_DIR" || return 1
+    if [ -L "$FAIL2BAN_VPSBOX_SSHD_CONF" ] ||
+        { [ -e "$FAIL2BAN_VPSBOX_SSHD_CONF" ] && [ ! -f "$FAIL2BAN_VPSBOX_SSHD_CONF" ]; }; then
+        err "Fail2ban SSH 防护配置路径不安全，已拒绝修改：$FAIL2BAN_VPSBOX_SSHD_CONF"
+        return 1
+    fi
     backup_change_file_once FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
     ports="$(ssh_effective_ports_csv)" || {
         err "无法读取 SSH 当前生效端口，已取消同步 Fail2ban。"
@@ -6942,14 +8000,12 @@ sync_fail2ban_sshd_port() {
     }
     chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
 
-    mv -f "$tmp" "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
+    if ! mv -f "$tmp" "$FAIL2BAN_VPSBOX_SSHD_CONF"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
     if ! fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1; then
-        if [ -n "$backup" ]; then
-            cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
-        else
-            rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
-        fi
-        err "Fail2ban 配置预检失败，已恢复现有 SSH 防护配置。"
+        fail2ban_sync_failure_with_rollback "Fail2ban 配置预检失败" "$backup" "$was_running" || true
         return 1
     fi
 
@@ -6960,16 +8016,8 @@ sync_fail2ban_sshd_port() {
             service_action="start"
         fi
         if ! retry 3 2 systemctl "$service_action" fail2ban; then
-            if [ -n "$backup" ]; then
-                cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
-            else
-                rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
-            fi
-            if [ "$was_running" -eq 1 ]; then
-                systemctl restart fail2ban >/dev/null 2>&1 || true
-            else
-                systemctl stop fail2ban >/dev/null 2>&1 || true
-            fi
+            fail2ban_sync_failure_with_rollback \
+                "Fail2ban 服务启动或重启失败" "$backup" "$was_running" || true
             return 1
         fi
     elif command -v rc-service >/dev/null 2>&1; then
@@ -6979,44 +8027,20 @@ sync_fail2ban_sshd_port() {
             service_action="start"
         fi
         if ! retry 3 2 rc-service fail2ban "$service_action"; then
-            if [ -n "$backup" ]; then
-                cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
-            else
-                rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
-            fi
-            if [ "$was_running" -eq 1 ]; then
-                rc-service fail2ban restart >/dev/null 2>&1 || true
-            else
-                rc-service fail2ban stop >/dev/null 2>&1 || true
-            fi
+            fail2ban_sync_failure_with_rollback \
+                "Fail2ban 服务启动或重启失败" "$backup" "$was_running" || true
             return 1
         fi
     else
-        err "未找到 Fail2ban 服务重启方式。"
+        fail2ban_sync_failure_with_rollback \
+            "未找到 Fail2ban 服务启动或重启方式" "$backup" "$was_running" || true
         return 1
     fi
 
-    rm -f "$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd-port.local"
     if ! retry 5 1 fail2ban-client status sshd >/dev/null 2>&1; then
-        if [ -n "$backup" ]; then
-            cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
-        else
-            rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
-        fi
-        if is_systemd; then
-            if [ "$was_running" -eq 1 ]; then
-                systemctl restart fail2ban >/dev/null 2>&1 || true
-            else
-                systemctl stop fail2ban >/dev/null 2>&1 || true
-            fi
-        elif command -v rc-service >/dev/null 2>&1; then
-            if [ "$was_running" -eq 1 ]; then
-                rc-service fail2ban restart >/dev/null 2>&1 || true
-            else
-                rc-service fail2ban stop >/dev/null 2>&1 || true
-            fi
-        fi
-        err "Fail2ban 服务已启动，但 sshd jail 未在预期时间内就绪。"
+        fail2ban_sync_failure_with_rollback \
+            "Fail2ban 服务已启动，但 sshd jail 未在预期时间内就绪" \
+            "$backup" "$was_running" || true
         return 1
     fi
     if verify_fail2ban_real_ban; then
@@ -7036,7 +8060,15 @@ sync_fail2ban_sshd_port() {
         err "Fail2ban 配置验证通过，但无法恢复同步前的停止状态。"
         return 1
     fi
-    mark_change_applied FAIL2BAN_SSHD || return 1
+    if ! mark_change_applied FAIL2BAN_SSHD; then
+        fail2ban_sync_failure_with_rollback \
+            "Fail2ban 防护已验证，但无法记录已应用状态" "$backup" "$was_running" || true
+        return 1
+    fi
+    # 旧版本曾使用该文件名；新文件按字典序后加载并已验证生效，因此旧文件清理失败
+    # 只保留为兼容残留，不应把已成功应用的防护状态误报为失败。
+    rm -f "$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd-port.local" ||
+        warn "旧版 Fail2ban SSH 端口配置未能清理，可稍后手动删除。"
     prune_fail2ban_sshd_backups || warn "Fail2ban 历史备份清理不完整，最多保留 5 份的策略未完全执行。"
 }
 
@@ -7058,8 +8090,8 @@ apply_ssh_port_change() {
         return 1
     fi
 
-    if ssh_socket_activation_active; then
-        err "检测到 SSH socket activation 正在运行；为避免误改监听端口，当前不自动修改。"
+    if ssh_socket_activation_enabled_or_active; then
+        err "检测到 SSH socket activation 正在运行或已启用；为避免重启后端口错配，当前不自动修改。"
         err "请先通过控制台处理 ssh.socket/sshd.socket，或关闭 socket activation 后重试。"
         return 1
     fi
@@ -7146,7 +8178,7 @@ apply_ssh_port_change() {
     fi
     ACTIVE_UNAPPLIED_SSH_TRACKING=0
 
-    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_dropin_include_available; } || { ! sshd_main_has_active_port_directive && sshd_dropin_include_available; }; then
+    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_vpsbox_port_include_available; } || { ! sshd_main_has_active_port_directive && sshd_vpsbox_port_include_available; }; then
         write_action="vpsbox drop-in"
         write_vpsbox_ssh_port_config || {
             err "写入 SSH drop-in 失败，正在回滚。"
@@ -7299,21 +8331,28 @@ apply_ssh_basic_hardening() {
 
     if ! write_vpsbox_ssh_hardening_config || ! ensure_sshd_dropin_include; then
         err "写入 SSH 基础加固配置失败，正在回滚。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 ||
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 "$original_ports" ||
             warn "SSH 配置未能完整回滚，恢复标记已保留。"
         return 1
     fi
 
     if ! validate_ssh_hardening_effective_config; then
         err "SSH 基础加固配置验证失败，正在回滚。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 ||
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 "$original_ports" ||
             warn "SSH 配置未能完整回滚，恢复标记已保留。"
         return 1
     fi
 
     if ! restart_ssh_service; then
         err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 1 ||
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 1 "$original_ports" ||
+            warn "SSH 配置或服务未能完整回滚，恢复标记已保留。"
+        return 1
+    fi
+
+    if ! wait_for_any_ssh_listener_csv "$original_ports"; then
+        err "SSH 服务重启后未恢复原端口监听（$original_ports），正在回滚配置并尝试恢复服务。"
+        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 1 "$original_ports" ||
             warn "SSH 配置或服务未能完整回滚，恢复标记已保留。"
         return 1
     fi
@@ -7396,19 +8435,214 @@ cat <<EOF
 EOF
 }
 
-restore_ssh_runtime_snapshot() {
-    local snapshot_dir="$1" expected_ports="$2" name path bin
+ssh_restore_snapshot_root() {
+    printf '%s\n' "$VPSBOX_STATE_DIR/ssh-restore-snapshots"
+}
 
-    [[ "$snapshot_dir" == /tmp/vpsbox-ssh-restore.* ]] &&
+ssh_restore_snapshot_path_allowed() {
+    local snapshot_dir="$1" root parent base
+
+    root="$(ssh_restore_snapshot_root)"
+    parent="$(dirname -- "$snapshot_dir")"
+    base="${snapshot_dir##*/}"
+    if [ "$parent" = "$root" ]; then
+        [[ "$base" == restore.* || "$base" == .building.* ]]
+    elif [ "$parent" = /tmp ]; then
+        [[ "$base" == vpsbox-ssh-restore.* ]]
+    else
+        return 1
+    fi
+}
+
+remove_ssh_restore_snapshot() {
+    local snapshot_dir="$1"
+
+    ssh_restore_snapshot_path_allowed "$snapshot_dir" &&
         [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    rm -rf -- "$snapshot_dir"
+}
+
+ssh_restore_snapshot_path_is_secure() {
+    local path="$1" expected_mode="$2" owner group mode
+
+    [ ! -L "$path" ] || return 1
+    [ "${VPSBOX_TEST_MODE:-0}" = "1" ] && return 0
+    owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$path" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] && [ "$mode" = "$expected_mode" ]
+}
+
+ssh_restore_snapshot_manifest_entry() {
+    local manifest="$1" name="$2"
+
+    awk -F'|' -v name="$name" '
+        $1 == name { line=$0; count++ }
+        END {
+            if (count == 1) print line
+            else exit 1
+        }
+    ' "$manifest"
+}
+
+ssh_restore_snapshot_dir_valid() {
+    local snapshot_dir="$1" root manifest name entry state mode digest path actual
+
+    ssh_restore_snapshot_path_allowed "$snapshot_dir" &&
+        [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    root="$(ssh_restore_snapshot_root)"
+    if [[ "$snapshot_dir" == /tmp/vpsbox-ssh-restore.* ]]; then
+        # 兼容 v1.0.32 及更早版本在 /tmp 创建、且没有完整性清单的 SSH 恢复快照。
+        ssh_restore_snapshot_path_is_secure "$snapshot_dir" 700 || return 1
+        for name in main port hardening; do
+            if [ -f "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ] &&
+                [ ! -e "$snapshot_dir/$name.absent" ] && [ ! -L "$snapshot_dir/$name.absent" ]; then
+                if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
+                    mode="$(stat -c '%a' "$snapshot_dir/$name" 2>/dev/null)" || return 1
+                    [[ "$mode" =~ ^[0-7]{3,4}$ ]] &&
+                        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+                fi
+            elif [ -f "$snapshot_dir/$name.absent" ] && [ ! -L "$snapshot_dir/$name.absent" ] &&
+                [ ! -e "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ]; then
+                :
+            else
+                return 1
+            fi
+        done
+        return 0
+    fi
+    [[ "$snapshot_dir" == "$root"/restore.* ]] || return 1
+    [ -d "$root" ] && [ ! -L "$root" ] &&
+        ssh_restore_snapshot_path_is_secure "$root" 700 || return 1
+    ssh_restore_snapshot_path_is_secure "$snapshot_dir" 700 || return 1
+    manifest="$snapshot_dir/manifest"
+    [ -f "$manifest" ] && [ ! -L "$manifest" ] &&
+        ssh_restore_snapshot_path_is_secure "$manifest" 600 || return 1
+    [ "$(awk 'END { print NR + 0 }' "$manifest")" = "3" ] || return 1
+    for name in main port hardening; do
+        entry="$(ssh_restore_snapshot_manifest_entry "$manifest" "$name")" || return 1
+        IFS='|' read -r _ state mode digest <<< "$entry"
+        case "$state" in
+            file)
+                [[ "$mode" =~ ^[0-7]{3,4}$ ]] &&
+                    [ $((8#$mode & 8#022)) -eq 0 ] ||
+                    return 1
+                path="$snapshot_dir/$name"
+                [ -f "$path" ] && [ ! -L "$path" ] &&
+                    [ ! -e "$snapshot_dir/$name.absent" ] &&
+                    ssh_restore_snapshot_path_is_secure "$path" 600 || return 1
+                ;;
+            absent)
+                [ "$mode" = "-" ] || return 1
+                path="$snapshot_dir/$name.absent"
+                [ -f "$path" ] && [ ! -L "$path" ] &&
+                    [ ! -e "$snapshot_dir/$name" ] &&
+                    ssh_restore_snapshot_path_is_secure "$path" 600 || return 1
+                ;;
+            *) return 1 ;;
+        esac
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+        actual="$(sha256sum "$path" 2>/dev/null | awk '{print $1}')" || return 1
+        [ "$actual" = "$digest" ] || return 1
+    done
+}
+
+create_ssh_restore_snapshot() {
+    local output_var="$1" root build final suffix manifest name path mode digest
+
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    ensure_change_store || return 1
+    root="$(ssh_restore_snapshot_root)"
+    [ ! -L "$root" ] || return 1
+    mkdir -p "$root" || return 1
+    chown root:root "$root" || return 1
+    chmod 700 "$root" || return 1
+    build="$(mktemp -d "$root/.building.XXXXXX")" || return 1
+    chown root:root "$build" && chmod 700 "$build" || {
+        remove_ssh_restore_snapshot "$build" || true
+        return 1
+    }
+    manifest="$build/manifest"
     for name in main port hardening; do
         case "$name" in
             main) path="$SSHD_MAIN_CONF" ;;
             port) path="$SSHD_VPSBOX_PORT_CONF" ;;
             hardening) path="$SSHD_VPSBOX_HARDENING_CONF" ;;
         esac
-        if [ -e "$snapshot_dir/$name" ] || [ -L "$snapshot_dir/$name" ]; then
-            rm -f "$path" && cp -a "$snapshot_dir/$name" "$path" || return 1
+        if [ -f "$path" ] && [ ! -L "$path" ]; then
+            mode="$(stat -c '%a' "$path" 2>/dev/null)" &&
+                [[ "$mode" =~ ^[0-7]{3,4}$ ]] &&
+                [ $((8#$mode & 8#022)) -eq 0 ] &&
+                cp -- "$path" "$build/$name" &&
+                chown root:root "$build/$name" &&
+                chmod 600 "$build/$name" || {
+                remove_ssh_restore_snapshot "$build" || true
+                return 1
+            }
+            digest="$(sha256sum "$build/$name" | awk '{print $1}')" || {
+                remove_ssh_restore_snapshot "$build" || true
+                return 1
+            }
+            printf '%s|file|%s|%s\n' "$name" "$mode" "$digest" >> "$manifest" || {
+                remove_ssh_restore_snapshot "$build" || true
+                return 1
+            }
+        elif [ ! -e "$path" ] && [ ! -L "$path" ]; then
+            : > "$build/$name.absent" &&
+                chown root:root "$build/$name.absent" &&
+                chmod 600 "$build/$name.absent" || {
+                remove_ssh_restore_snapshot "$build" || true
+                return 1
+            }
+            digest="$(sha256sum "$build/$name.absent" | awk '{print $1}')" || {
+                remove_ssh_restore_snapshot "$build" || true
+                return 1
+            }
+            printf '%s|absent|-|%s\n' "$name" "$digest" >> "$manifest" || {
+                remove_ssh_restore_snapshot "$build" || true
+                return 1
+            }
+        else
+            remove_ssh_restore_snapshot "$build" || true
+            return 1
+        fi
+    done
+    chown root:root "$manifest" && chmod 600 "$manifest" || {
+        remove_ssh_restore_snapshot "$build" || true
+        return 1
+    }
+    suffix="${build##*.building.}"
+    final="$root/restore.$suffix"
+    [ ! -e "$final" ] && mv -- "$build" "$final" || {
+        remove_ssh_restore_snapshot "$build" || true
+        return 1
+    }
+    ssh_restore_snapshot_dir_valid "$final" || {
+        remove_ssh_restore_snapshot "$final" || true
+        return 1
+    }
+    printf -v "$output_var" '%s' "$final"
+}
+
+restore_ssh_runtime_snapshot() {
+    local snapshot_dir="$1" expected_ports="$2" name path bin entry mode
+
+    ssh_restore_snapshot_dir_valid "$snapshot_dir" || return 1
+    for name in main port hardening; do
+        case "$name" in
+            main) path="$SSHD_MAIN_CONF" ;;
+            port) path="$SSHD_VPSBOX_PORT_CONF" ;;
+            hardening) path="$SSHD_VPSBOX_HARDENING_CONF" ;;
+        esac
+        if [ -f "$snapshot_dir/$name" ]; then
+            if [[ "$snapshot_dir" == /tmp/vpsbox-ssh-restore.* ]]; then
+                mode="$(stat -c '%a' "$snapshot_dir/$name" 2>/dev/null)" || return 1
+            else
+                entry="$(ssh_restore_snapshot_manifest_entry "$snapshot_dir/manifest" "$name")" ||
+                    return 1
+                IFS='|' read -r _ _ mode _ <<< "$entry"
+            fi
+            install_ssh_config_atomically "$snapshot_dir/$name" "$path" "$mode" || return 1
         elif [ -f "$snapshot_dir/$name.absent" ]; then
             rm -f "$path" || return 1
         else
@@ -7441,7 +8675,7 @@ settle_failed_ssh_restore() {
 }
 
 restore_vpsbox_ssh_config() {
-    local confirm tmp original_ports current_ports name path
+    local confirm tmp original_ports current_ports transition_ports
 
     [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] || {
         warn "没有已记录的 vpsbox SSH 配置可恢复。"
@@ -7456,50 +8690,62 @@ restore_vpsbox_ssh_config() {
         err "未记录可恢复的 SSH 原端口，已拒绝自动恢复。"
         return 1
     }
-    current_ports="$(ssh_effective_ports_csv)" || {
-        err "无法读取 SSH 当前生效端口，已拒绝自动恢复。"
+    # 恢复入口必须在当前 sshd_config 已损坏时仍可使用，因此安全端口取自
+    # 实际监听和当前 SSH 连接，不再依赖 sshd -T 成功。
+    current_ports="$(ssh_listening_ports_csv 2>/dev/null || true)"
+    current_ports="$(merge_port_csv "$current_ports" "$(ssh_connection_server_port 2>/dev/null || true)")" ||
+        return 1
+    transition_ports="$(merge_port_csv "$original_ports" "$current_ports")" || return 1
+    [ -n "$transition_ports" ] || {
+        err "无法确定待恢复或当前连接使用的 SSH 安全端口，已拒绝自动恢复。"
         return 1
     }
     echo "将恢复 SSH 主配置及 vpsbox 端口/加固 drop-in。"
     echo "预期恢复端口：${original_ports:-未知}；当前连接可能断开。"
     read -r -p "请确认已有控制台或备用连接。输入 YES 执行 SSH 恢复：" confirm
     [ "$confirm" = "YES" ] || { info "已取消 SSH 恢复。"; return 0; }
-    if ! ssh_firewall_transition_begin "$original_ports"; then
+    if ! ssh_firewall_transition_begin "$transition_ports"; then
         err "主机防火墙无法临时放行待恢复的 SSH 端口，已取消恢复。"
         return 1
     fi
 
-    tmp="$(mktemp -d /tmp/vpsbox-ssh-restore.XXXXXX)" || {
+    if ! create_ssh_restore_snapshot tmp; then
         ssh_firewall_transition_abort || true
+        err "无法创建可校验的 SSH 恢复前快照，已取消恢复。"
         return 1
-    }
-    for name in main port hardening; do
-        case "$name" in
-            main) path="$SSHD_MAIN_CONF" ;;
-            port) path="$SSHD_VPSBOX_PORT_CONF" ;;
-            hardening) path="$SSHD_VPSBOX_HARDENING_CONF" ;;
-        esac
-        if [ -e "$path" ]; then cp -a "$path" "$tmp/$name"; else : > "$tmp/$name.absent"; fi
-    done
+    fi
     if ! restore_change_file SSHD_MAIN "$SSHD_MAIN_CONF" || ! restore_change_file SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || ! restore_change_file SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || ! "$(sshd_binary)" -t; then
         err "SSH 恢复配置校验失败，正在回滚当前配置。"
-        settle_failed_ssh_restore "$tmp" "$current_ports" || true
-        rm -rf "$tmp"
+        if settle_failed_ssh_restore "$tmp" "$current_ports"; then
+            remove_ssh_restore_snapshot "$tmp" ||
+                warn "SSH 已回滚，但恢复前快照未能清理：$tmp"
+        else
+            err "SSH 自动回滚未完成，已保留本次恢复前快照：$tmp"
+        fi
         return 1
     fi
     if ! restart_ssh_service || ! wait_for_any_ssh_listener_csv "$original_ports"; then
         err "SSH 服务未能在原端口恢复监听，正在回滚当前配置。"
-        settle_failed_ssh_restore "$tmp" "$current_ports" || true
-        rm -rf "$tmp"
+        if settle_failed_ssh_restore "$tmp" "$current_ports"; then
+            remove_ssh_restore_snapshot "$tmp" ||
+                warn "SSH 已回滚，但恢复前快照未能清理：$tmp"
+        else
+            err "SSH 自动回滚未完成，已保留本次恢复前快照：$tmp"
+        fi
         return 1
     fi
     if ! ssh_firewall_transition_finish; then
         err "主机防火墙无法同步恢复后的 SSH 端口，正在回滚当前配置。"
-        settle_failed_ssh_restore "$tmp" "$current_ports" || true
-        rm -rf "$tmp"
+        if settle_failed_ssh_restore "$tmp" "$current_ports"; then
+            remove_ssh_restore_snapshot "$tmp" ||
+                warn "SSH 已回滚，但恢复前快照未能清理：$tmp"
+        else
+            err "SSH 自动回滚未完成，已保留本次恢复前快照：$tmp"
+        fi
         return 1
     fi
-    rm -rf "$tmp"
+    remove_ssh_restore_snapshot "$tmp" ||
+        warn "SSH 已恢复，但恢复前快照未能清理：$tmp"
     if ! clear_ssh_change_tracking; then
         err "SSH 配置已恢复，但变更清单清理失败；已保留剩余记录供人工核验。"
         return 1
@@ -7691,8 +8937,7 @@ repair_bbr_fq_runtime() {
 }
 
 enable_bbr_fq() {
-    local old_cc old_fq tmp backup_dir
-    local had_old_conf=0
+    local old_cc old_fq tmp
 
     if bbr_fq_persistent_config_is_current; then
         if bbr_fq_runtime_is_current; then
@@ -7714,29 +8959,25 @@ enable_bbr_fq() {
     backup_change_file_once BBR_CONF "$BBR_CONF" || { err "记录 BBR 原配置失败，已取消修改。"; return 1; }
     manifest_set_once BBR_CC "${old_cc:-unknown}" || return 1
     manifest_set_once BBR_FQ "${old_fq:-unknown}" || return 1
-    backup_dir="$(mktemp -d /tmp/vpsbox-bbr.XXXXXX)" || return 1
     if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ]; then
-        [ ! -L "$BBR_CONF" ] || { rm -rf "$backup_dir"; err "$BBR_CONF 是符号链接，已拒绝覆盖。"; return 1; }
-        cp -a "$BBR_CONF" "$backup_dir/99-vpsbox-bbr.conf" || { rm -rf "$backup_dir"; err "备份 BBR 配置失败。"; return 1; }
-        had_old_conf=1
+        [ ! -L "$BBR_CONF" ] || { err "$BBR_CONF 是符号链接，已拒绝覆盖。"; return 1; }
     fi
-    begin_change_transaction BBR_CONF || { rm -rf "$backup_dir"; err "记录 BBR 修改事务失败，已取消修改。"; return 1; }
-    tmp="$(mktemp /etc/sysctl.d/.vpsbox-bbr.XXXXXX)" || { rm -rf "$backup_dir"; return 1; }
+    begin_change_transaction BBR_CONF || { err "记录 BBR 修改事务失败，已取消修改。"; return 1; }
+    tmp="$(mktemp /etc/sysctl.d/.vpsbox-bbr.XXXXXX)" || return 1
     render_bbr_fq_config > "$tmp" || {
         rm -f "$tmp"
-        rm -rf "$backup_dir"
         return 1
     }
 
     if ! modprobe tcp_bbr >/dev/null 2>&1 || ! modprobe sch_fq >/dev/null 2>&1; then
-        rm -f "$tmp"; rm -rf "$backup_dir"
+        rm -f "$tmp"
         err "内核不支持 tcp_bbr 或 sch_fq，未写入持久化配置。"
         return 1
     fi
     if ! sysctl -p "$tmp" >/dev/null 2>&1 || [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" != "bbr" ] || [ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" != "fq" ]; then
         [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
         [ -n "$old_fq" ] && sysctl -w "net.core.default_qdisc=$old_fq" >/dev/null 2>&1 || true
-        rm -f "$tmp"; rm -rf "$backup_dir"
+        rm -f "$tmp"
         err "BBR + fq 未能同时生效，已恢复运行时内核参数，未写入持久化配置。"
         return 1
     fi
@@ -7744,12 +8985,10 @@ enable_bbr_fq() {
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$BBR_CONF"; then
         [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
         [ -n "$old_fq" ] && sysctl -w "net.core.default_qdisc=$old_fq" >/dev/null 2>&1 || true
-        if [ "$had_old_conf" -eq 1 ]; then cp -a "$backup_dir/99-vpsbox-bbr.conf" "$BBR_CONF"; else rm -f "$BBR_CONF"; fi
-        rm -f "$tmp"; rm -rf "$backup_dir"
-        err "保存 BBR 配置失败，已回滚。"
+        rm -f "$tmp"
+        err "保存 BBR 配置失败；原持久化配置未被替换，运行时参数已尝试恢复。"
         return 1
     fi
-    rm -rf "$backup_dir"
     mark_change_applied BBR_CONF || return 1
 
     echo ""
@@ -9593,6 +10832,84 @@ stop_watchdog_wait() {
     exit 0
 }
 
+restore_lock_process_start() {
+    awk '{ print \$22 }' "/proc/\$1/stat" 2>/dev/null
+}
+
+restore_lock_metadata_value() {
+    metadata_file="\$1"
+    metadata_key="\$2"
+    awk -F= -v key="\$metadata_key" '\$1 == key { print substr(\$0, length(key) + 2); exit }' \
+        "\$metadata_file" 2>/dev/null
+}
+
+restore_lock_metadata_ready() {
+    lock_dir="\$dir/restore.lock"
+    [ -s "\$lock_dir/owner" ] ||
+        { [ -s "\$lock_dir/pid" ] && [ -s "\$lock_dir/start" ] && [ -s "\$lock_dir/boot" ]; }
+}
+
+restore_lock_owner_matches() {
+    lock_dir="\$dir/restore.lock"
+    [ -d "\$lock_dir" ] && [ ! -L "\$lock_dir" ] || return 1
+    if [ -s "\$lock_dir/owner" ] && [ ! -L "\$lock_dir/owner" ]; then
+        lock_pid="\$(restore_lock_metadata_value "\$lock_dir/owner" pid)" || return 1
+        lock_start="\$(restore_lock_metadata_value "\$lock_dir/owner" start)" || return 1
+        lock_boot="\$(restore_lock_metadata_value "\$lock_dir/owner" boot)" || return 1
+    else
+        # 兼容 v1.0.32 及更早版本生成的 pid/start/boot 三文件锁。
+        lock_pid="\$(cat "\$lock_dir/pid" 2>/dev/null)" || return 1
+        lock_start="\$(cat "\$lock_dir/start" 2>/dev/null)" || return 1
+        lock_boot="\$(cat "\$lock_dir/boot" 2>/dev/null)" || return 1
+    fi
+    case "\$lock_pid:\$lock_start" in
+        *[!0-9:]*|:*|*:) return 1 ;;
+    esac
+    kill -0 "\$lock_pid" 2>/dev/null || return 1
+    [ "\$(restore_lock_process_start "\$lock_pid")" = "\$lock_start" ] &&
+        [ "\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" = "\$lock_boot" ]
+}
+
+cleanup_restore_lock() {
+    lock_dir="\$dir/restore.lock"
+    rm -f "\$lock_dir/owner" "\$lock_dir/pid" "\$lock_dir/start" "\$lock_dir/boot" \
+        "\$dir/.restore.lock.owner.\$\$"
+    rmdir "\$lock_dir" >/dev/null 2>&1 || true
+}
+
+acquire_restore_lock() {
+    lock_dir="\$dir/restore.lock"
+    if ! mkdir "\$lock_dir" 2>/dev/null; then
+        [ -d "\$lock_dir" ] && [ ! -L "\$lock_dir" ] || return 1
+        lock_wait=0
+        while [ "\$lock_wait" -lt 30 ] && ! restore_lock_metadata_ready; do
+            sleep 0.1
+            lock_wait=\$((lock_wait + 1))
+        done
+        restore_lock_owner_matches && return 2
+        # 旧回滚进程被 SIGKILL 后可能遗留 restore.lock。只有持有者身份已失效，
+        # 且目录中仅含 vpsbox 元数据时才回收，避免覆盖仍在执行的恢复。
+        rm -f "\$lock_dir/owner" "\$lock_dir/pid" "\$lock_dir/start" "\$lock_dir/boot"
+        rmdir "\$lock_dir" 2>/dev/null || return 1
+        mkdir "\$lock_dir" 2>/dev/null || return 1
+    fi
+    lock_start="\$(restore_lock_process_start "\$\$")"
+    lock_boot="\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+    case "\$lock_start" in ''|*[!0-9]*) cleanup_restore_lock; return 1 ;; esac
+    [ -n "\$lock_boot" ] || { cleanup_restore_lock; return 1; }
+    owner_tmp="\$dir/.restore.lock.owner.\$\$"
+    {
+        printf 'pid=%s\n' "\$\$"
+        printf 'start=%s\n' "\$lock_start"
+        printf 'boot=%s\n' "\$lock_boot"
+    } > "\$owner_tmp" &&
+        chmod 600 "\$owner_tmp" &&
+        mv -f "\$owner_tmp" "\$lock_dir/owner" || {
+        cleanup_restore_lock
+        return 1
+    }
+}
+
 if [ "\$mode" != "--now" ] && [ "\$mode" != "--commit-owner" ]; then
     trap stop_watchdog_wait HUP INT TERM
     waited=0
@@ -9624,8 +10941,15 @@ else
     fi
 fi
 
-mkdir "\$dir/restore.lock" 2>/dev/null || exit 0
-trap 'rmdir "\$dir/restore.lock" >/dev/null 2>&1 || true' EXIT
+if acquire_restore_lock; then
+    :
+else
+    restore_lock_status=\$?
+    [ "\$restore_lock_status" -eq 2 ] && exit 0
+    : > "\$dir/rollback-failed"
+    exit 1
+fi
+trap cleanup_restore_lock EXIT
 trap 'exit 1' HUP INT TERM
 [ ! -e "\$dir/completed" ] || exit 0
 [ ! -e "\$dir/rolled-back" ] || exit 0
@@ -11441,11 +12765,7 @@ run_nexttrace_sized_target() {
         "$ip"
     )
 
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 30 nexttrace "${args[@]}" 2>&1
-    else
-        nexttrace "${args[@]}" 2>&1
-    fi
+    run_bounded_command 30 nexttrace "${args[@]}" 2>&1
 }
 
 trace_asn_path_file() {
@@ -11975,15 +13295,15 @@ set_system_hostname() {
 hostname_hosts_markers_valid() {
     local begin_count end_count begin_line end_line
 
-    [ -f /etc/hosts ] && [ ! -L /etc/hosts ] || return 1
-    begin_count="$(grep -Fxc "$HOSTNAME_BEGIN" /etc/hosts 2>/dev/null || true)"
-    end_count="$(grep -Fxc "$HOSTNAME_END" /etc/hosts 2>/dev/null || true)"
+    [ -f "$HOSTS_PATH" ] && [ ! -L "$HOSTS_PATH" ] || return 1
+    begin_count="$(grep -Fxc "$HOSTNAME_BEGIN" "$HOSTS_PATH" 2>/dev/null || true)"
+    end_count="$(grep -Fxc "$HOSTNAME_END" "$HOSTS_PATH" 2>/dev/null || true)"
     if [ "$begin_count" = "0" ] && [ "$end_count" = "0" ]; then
         return 0
     fi
     [ "$begin_count" = "1" ] && [ "$end_count" = "1" ] || return 1
-    begin_line="$(grep -Fnx "$HOSTNAME_BEGIN" /etc/hosts | cut -d: -f1)"
-    end_line="$(grep -Fnx "$HOSTNAME_END" /etc/hosts | cut -d: -f1)"
+    begin_line="$(grep -Fnx "$HOSTNAME_BEGIN" "$HOSTS_PATH" | cut -d: -f1)"
+    end_line="$(grep -Fnx "$HOSTNAME_END" "$HOSTS_PATH" | cut -d: -f1)"
     [ "$begin_line" -lt "$end_line" ]
 }
 
@@ -11991,16 +13311,92 @@ hostname_short_name() {
     printf '%s\n' "${1%%.*}"
 }
 
-rollback_hostname_change() {
-    local original="$1"
+hostname_snapshot_file() {
+    local dir="$1" name="$2" target="$3"
 
-    restore_change_file HOSTNAME_FILE /etc/hostname >/dev/null 2>&1 || true
-    restore_change_file HOSTS_FILE /etc/hosts >/dev/null 2>&1 || true
-    set_system_hostname "$original" >/dev/null 2>&1 || true
+    [ ! -L "$target" ] || return 1
+    if [ -e "$target" ]; then
+        [ -f "$target" ] || return 1
+        cp -a -- "$target" "$dir/$name" || return 1
+        : > "$dir/$name.present"
+    else
+        : > "$dir/$name.absent"
+    fi
+}
+
+create_hostname_operation_snapshot() {
+    local output_var="$1" current_hostname="$2" dir
+
+    dir="$(mktemp -d /tmp/vpsbox-hostname.XXXXXX)" || return 1
+    chmod 700 "$dir" || { rm -rf -- "$dir"; return 1; }
+    if ! hostname_snapshot_file "$dir" hostname "$HOSTNAME_PATH" ||
+        ! hostname_snapshot_file "$dir" hosts "$HOSTS_PATH" ||
+        ! printf '%s\n' "$current_hostname" > "$dir/runtime-hostname" ||
+        ! chmod 600 "$dir/runtime-hostname"; then
+        rm -rf -- "$dir"
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$dir"
+}
+
+restore_hostname_snapshot_file() {
+    local dir="$1" name="$2" target="$3" parent tmp
+
+    if [ -e "$dir/$name.present" ]; then
+        [ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || return 1
+        parent="$(dirname "$target")"
+        [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+        tmp="$(mktemp "$parent/.vpsbox-hostname-restore.XXXXXX")" || return 1
+        if ! cp -a -- "$dir/$name" "$tmp" ||
+            { [ -L "$target" ] && ! rm -f -- "$target"; } ||
+            ! mv -f -- "$tmp" "$target"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    elif [ -e "$dir/$name.absent" ]; then
+        rm -f -- "$target"
+    else
+        return 1
+    fi
+}
+
+hostname_operation_snapshot_valid() {
+    local dir="$1" runtime
+
+    { [[ "$dir" == /tmp/vpsbox-hostname.* ]] ||
+        [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ -f "$dir/runtime-hostname" ] && [ ! -L "$dir/runtime-hostname" ] || return 1
+    runtime="$(cat "$dir/runtime-hostname" 2>/dev/null || true)"
+    is_valid_hostname_value "$runtime" || return 1
+    { [ -e "$dir/hostname.present" ] && [ ! -e "$dir/hostname.absent" ]; } ||
+        { [ -e "$dir/hostname.absent" ] && [ ! -e "$dir/hostname.present" ]; } || return 1
+    { [ -e "$dir/hosts.present" ] && [ ! -e "$dir/hosts.absent" ]; } ||
+        { [ -e "$dir/hosts.absent" ] && [ ! -e "$dir/hosts.present" ]; } || return 1
+}
+
+rollback_hostname_change() {
+    local snapshot="$1" original failed=0
+
+    hostname_operation_snapshot_valid "$snapshot" || return 1
+    original="$(cat "$snapshot/runtime-hostname")"
+    restore_hostname_snapshot_file "$snapshot" hostname "$HOSTNAME_PATH" || failed=1
+    restore_hostname_snapshot_file "$snapshot" hosts "$HOSTS_PATH" || failed=1
+    set_system_hostname "$original" >/dev/null 2>&1 || failed=1
+    [ "$(hostname_current_value 2>/dev/null || true)" = "$original" ] || failed=1
+    if [ "$failed" -eq 0 ]; then
+        manifest_remove PENDING_HOSTNAME || failed=1
+    fi
+    if [ "$failed" -eq 0 ]; then
+        rm -rf -- "$snapshot"
+        return 0
+    fi
+    warn "本次主机名操作恢复未完成，临时快照已保留：$snapshot"
+    return 1
 }
 
 change_system_hostname() {
-    local old original new short_name hosts_entry tmp
+    local old new short_name hosts_entry tmp operation_snapshot=""
     old="$(hostname_current_value)"
     echo "当前主机名：$old"
     read -r -p "请输入新主机名（留空取消）: " new
@@ -12008,39 +13404,45 @@ change_system_hostname() {
     [ -n "$new" ] || { info "已取消。"; return 0; }
     is_valid_hostname_value "$new" || { err "主机名格式不正确：仅允许字母、数字、点和连字符，长度不超过 64。"; return 1; }
     [ "$new" != "$old" ] || { info "新旧主机名相同。"; return 0; }
-    [ ! -L /etc/hostname ] || { err "/etc/hostname 是符号链接，已拒绝修改。"; return 1; }
-    hostname_hosts_markers_valid || { err "/etc/hosts 是符号链接或 vpsbox 主机名标记异常，已拒绝修改。"; return 1; }
-    backup_change_file_once HOSTNAME_FILE /etc/hostname || return 1
-    backup_change_file_once HOSTS_FILE /etc/hosts || return 1
+    [ ! -L "$HOSTNAME_PATH" ] || { err "$HOSTNAME_PATH 是符号链接，已拒绝修改。"; return 1; }
+    hostname_hosts_markers_valid || { err "$HOSTS_PATH 是符号链接或 vpsbox 主机名标记异常，已拒绝修改。"; return 1; }
+    backup_change_file_once HOSTNAME_FILE "$HOSTNAME_PATH" || return 1
+    backup_change_file_once HOSTS_FILE "$HOSTS_PATH" || return 1
     manifest_set_once HOSTNAME_VALUE "$old" || return 1
-    original="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
-    [ -n "$original" ] || { err "无法记录原始主机名，已取消修改。"; return 1; }
     begin_change_transaction HOSTNAME || { err "记录主机名修改事务失败，已取消修改。"; return 1; }
+    if ! create_hostname_operation_snapshot operation_snapshot "$old"; then
+        manifest_remove PENDING_HOSTNAME || true
+        err "无法创建本次主机名操作快照，已取消修改。"
+        return 1
+    fi
     short_name="$(hostname_short_name "$new")"
     hosts_entry="127.0.1.1 $new"
     [ "$short_name" = "$new" ] || hosts_entry+=" $short_name"
 
-    tmp="$(mktemp /etc/.hostname.vpsbox.XXXXXX)" || return 1
+    tmp="$(mktemp "$(dirname "$HOSTNAME_PATH")/.hostname.vpsbox.XXXXXX")" || {
+        rollback_hostname_change "$operation_snapshot" || true
+        return 1
+    }
     printf '%s\n' "$new" > "$tmp"
-    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" /etc/hostname || ! set_system_hostname "$new"; then
+    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$HOSTNAME_PATH" || ! set_system_hostname "$new"; then
         rm -f "$tmp"
-        rollback_hostname_change "$original"
+        rollback_hostname_change "$operation_snapshot" || true
         err "主机名修改失败，已尝试恢复原主机名。"
         return 1
     fi
 
-    tmp="$(mktemp /etc/.hosts.vpsbox.XXXXXX)" || {
-        rollback_hostname_change "$original"
+    tmp="$(mktemp "$(dirname "$HOSTS_PATH")/.hosts.vpsbox.XXXXXX")" || {
+        rollback_hostname_change "$operation_snapshot" || true
         return 1
     }
     if ! awk -v begin="$HOSTNAME_BEGIN" -v end="$HOSTNAME_END" '
         $0 == begin { skip=1; next }
         $0 == end { skip=0; next }
         !skip { print }
-    ' /etc/hosts > "$tmp"; then
+    ' "$HOSTS_PATH" > "$tmp"; then
         rm -f "$tmp"
-        rollback_hostname_change "$original"
-        err "读取 /etc/hosts 失败，已恢复原配置。"
+        rollback_hostname_change "$operation_snapshot" || true
+        err "读取 $HOSTS_PATH 失败，已恢复原配置。"
         return 1
     fi
     {
@@ -12048,22 +13450,23 @@ change_system_hostname() {
         printf '%s\n' "$hosts_entry"
         printf '%s\n' "$HOSTNAME_END"
     } >> "$tmp"
-    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" /etc/hosts; then
+    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$HOSTS_PATH"; then
         rm -f "$tmp"
-        rollback_hostname_change "$original"
-        err "更新 /etc/hosts 失败，已恢复原配置。"
+        rollback_hostname_change "$operation_snapshot" || true
+        err "更新 $HOSTS_PATH 失败，已恢复原配置。"
         return 1
     fi
-    if [ "$(tr -d '\r\n' </etc/hostname)" != "$new" ] || [ "$(hostname_current_value)" != "$new" ] || ! grep -Fqx "$hosts_entry" /etc/hosts; then
-        rollback_hostname_change "$original"
+    if [ "$(tr -d '\r\n' <"$HOSTNAME_PATH")" != "$new" ] || [ "$(hostname_current_value)" != "$new" ] || ! grep -Fqx "$hosts_entry" "$HOSTS_PATH"; then
+        rollback_hostname_change "$operation_snapshot" || true
         err "主机名验证失败，已恢复原配置。"
         return 1
     fi
     if ! mark_change_applied HOSTNAME; then
-        rollback_hostname_change "$original"
+        rollback_hostname_change "$operation_snapshot" || true
         err "无法记录主机名变更，已恢复原配置。"
         return 1
     fi
+    rm -rf -- "$operation_snapshot"
     info "主机名已修改为：$new"
 }
 
@@ -12102,12 +13505,13 @@ cleanup_old_temp_dirs() {
         case "$path" in
             "${ACTIVE_NODE_BACKUP:-}"|"${ACTIVE_TRACE_TMP:-}") continue ;;
         esac
+        # 兼容 v1.0.32 及更早版本的 /tmp SSH 恢复快照：它可能是失败后仅存的
+        # 重试依据，因此不再由垃圾清理自动删除。
         case "$path" in
             "$base"/vpsbox-node-backup.*|\
             "$base"/vpsbox-sing-box-release.*|\
             "$base"/vpsbox-sing-box-update.*|\
             "$base"/vpsbox-chrony.*|\
-            "$base"/vpsbox-ssh-restore.*|\
             "$base"/vpsbox-bbr.*|\
             "$base"/vpsbox-trace.*|\
             "$base"/vpsbox-journald.*)
@@ -12120,7 +13524,6 @@ cleanup_old_temp_dirs() {
             -o -name 'vpsbox-sing-box-release.*' \
             -o -name 'vpsbox-sing-box-update.*' \
             -o -name 'vpsbox-chrony.*' \
-            -o -name 'vpsbox-ssh-restore.*' \
             -o -name 'vpsbox-bbr.*' \
             -o -name 'vpsbox-trace.*' \
             -o -name 'vpsbox-journald.*' \) \
@@ -12229,13 +13632,13 @@ restore_vpsbox_system_changes() {
     fi
 
     if change_needs_restore HOSTNAME; then
-        restore_change_file HOSTNAME_FILE /etc/hostname || failed=1
-        restore_change_file HOSTS_FILE /etc/hosts || failed=1
+        restore_change_file HOSTNAME_FILE "$HOSTNAME_PATH" || failed=1
+        restore_change_file HOSTS_FILE "$HOSTS_PATH" || failed=1
         old="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
         [ -n "$old" ] && set_system_hostname "$old" 2>/dev/null || failed=1
     fi
 
-    if change_needs_restore DNS_RESOLV && ! restore_change_file DNS_RESOLV /etc/resolv.conf; then failed=1; fi
+    if change_needs_restore DNS_RESOLV && ! restore_change_file DNS_RESOLV "$RESOLV_CONF"; then failed=1; fi
     if change_needs_restore DNS_RESOLVED && ! restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf; then failed=1; fi
     if resolv_conf_managed_by_systemd_resolved && ! systemctl restart systemd-resolved; then failed=1; fi
 
@@ -12524,9 +13927,15 @@ EOF
 
     if ! systemctl restart systemd-journald || ! systemctl is-active --quiet systemd-journald || [ "$(journald_conf_value SystemMaxUse || true)" != "500M" ] || [ "$(journald_conf_value SystemMaxFileSize || true)" != "50M" ]; then
         err "journald 配置未生效，正在恢复原配置。"
-        if [ "$had_old" -eq 1 ]; then cp -a "$backup_dir/99-vpsbox.conf" "$JOURNALD_VPSBOX_CONF"; else rm -f "$JOURNALD_VPSBOX_CONF"; fi
-        systemctl restart systemd-journald 2>/dev/null || true
-        rm -rf "$backup_dir"
+        if restore_root_file_snapshot \
+            "$backup_dir/99-vpsbox.conf" "$JOURNALD_VPSBOX_CONF" "$had_old" &&
+            systemctl restart systemd-journald >/dev/null 2>&1; then
+            rm -rf "$backup_dir"
+            err "journald 配置未生效，已恢复修改前的配置与服务。"
+        else
+            err "journald 配置未生效，且未能完整恢复；恢复菜单中的原始基线仍保留。"
+            warn "本次临时备份保留在：$backup_dir"
+        fi
         return 1
     fi
     rm -rf "$backup_dir"
@@ -12890,6 +14299,10 @@ vpsbox_main() {
     need_root
     detect_os
     acquire_lock
+    recover_pending_singbox_update || {
+        err "sing-box 更新事务未能恢复，已停止启动 vpsbox，避免丢失旧二进制。"
+        return 1
+    }
     recover_pending_node_transaction || {
         err "节点事务未能恢复，已停止启动 vpsbox，避免覆盖现有节点。"
         return 1
