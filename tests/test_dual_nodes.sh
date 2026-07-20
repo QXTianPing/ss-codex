@@ -8,6 +8,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck source=../vpsbox.sh
 source "$REPO_DIR/vpsbox.sh"
 
+# 双节点夹具只验证配置与事务，不访问软件源安装宿主机依赖。
+node_dependencies_available() { return 0; }
+missing_node_commands() { printf '\n'; }
+
 mkdir -p "$TEST_TMP/bin"
 cat > "$TEST_TMP/bin/sing-box" <<'EOF'
 #!/bin/sh
@@ -785,6 +789,8 @@ test_singbox_update_rejects_mismatched_layout_before_download() {
         write_ss_state_fixture "$SS_STATE_FILE" 29999
         : > "$event_log"
         singbox_installed() { return 0; }
+        singbox_version() { printf '%s\n' 1.13.13; }
+        singbox_binary_is_package_managed() { return 0; }
         install_deps() { printf 'deps\n' >> "$event_log"; }
         run_singbox_installer() { printf 'installer\n' >> "$event_log"; }
 

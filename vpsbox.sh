@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.37"
+VPSBOX_VERSION="v1.0.38"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -1631,6 +1631,101 @@ install_deps() {
     esac
 }
 
+node_commands_available() {
+    local command_name
+
+    for command_name in "$@"; do
+        command -v "$command_name" >/dev/null 2>&1 || return 1
+    done
+}
+
+node_ca_trust_available() {
+    local bundle
+
+    for bundle in "$@"; do
+        [ -s "$bundle" ] && return 0
+    done
+    return 1
+}
+
+node_dependencies_available() {
+    node_commands_available curl openssl jq ss sha256sum base64 &&
+        node_ca_trust_available \
+            /etc/ssl/certs/ca-certificates.crt \
+            /etc/pki/tls/certs/ca-bundle.crt \
+            /etc/ssl/ca-bundle.pem \
+            /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+}
+
+missing_node_commands() {
+    local command_name missing=""
+
+    for command_name in "$@"; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            [ -n "$missing" ] && missing="$missing、"
+            missing="$missing$command_name"
+        fi
+    done
+    printf '%s\n' "$missing"
+}
+
+require_node_commands() {
+    local action="$1" missing
+
+    shift
+    missing="$(missing_node_commands "$@")"
+    [ -z "$missing" ] && return 0
+    err "$action 缺少必要命令：$missing。"
+    info "请先安装缺少的系统依赖后重试。"
+    return 1
+}
+
+ensure_node_dependencies() {
+    if node_dependencies_available; then
+        return 0
+    fi
+
+    info "vpsbox 节点管理依赖不完整，正在自动补齐..."
+    install_deps || {
+        err "vpsbox 节点管理依赖安装失败，请检查软件源或网络。"
+        return 1
+    }
+    if ! node_dependencies_available; then
+        err "vpsbox 节点管理依赖安装后仍不完整，需要 curl、openssl、jq、ss、sha256sum、base64 与可用的 CA 证书。"
+        return 1
+    fi
+}
+
+confirm_node_dependency_install() {
+    if node_dependencies_available; then
+        return 0
+    fi
+
+    warn "vpsbox 节点管理依赖不完整。"
+    if ! confirm_default_yes "是否安装缺少的依赖并继续？"; then
+        info "已取消，未安装依赖。"
+        return 1
+    fi
+    ensure_node_dependencies
+}
+
+ensure_node_runtime_commands() {
+    local missing
+
+    missing="$(missing_node_commands jq ss)"
+    [ -z "$missing" ] && return 0
+    warn "节点服务管理缺少必要命令：$missing。"
+    if ! confirm_default_yes "是否安装缺少的依赖并继续？"; then
+        info "已取消，未安装依赖。"
+        return 1
+    fi
+    install_deps || {
+        err "节点服务管理依赖安装失败，请检查软件源或网络。"
+        return 1
+    }
+    require_node_commands "节点服务管理" jq ss
+}
+
 singbox_installed() {
     command -v sing-box >/dev/null 2>&1
 }
@@ -1677,7 +1772,7 @@ install_singbox_if_missing() {
     fi
 
     info "未检测到 sing-box，开始自动安装..."
-    install_deps || return 1
+    ensure_node_dependencies || return 1
     detect_os
 
     # 使用固定官方 Release 包与 GitHub 提供的 SHA256，不混用 Alpine edge/community。
@@ -1692,6 +1787,7 @@ install_singbox_if_missing() {
 }
 
 install_singbox_for_node_transaction() {
+    ensure_node_dependencies || return 1
     if ! singbox_installed; then
         # 首次安装会写入二进制和服务文件，必须先把节点事务标记为已修改，
         # 这样安装中断后下次启动会恢复安装前的服务状态，而不是丢弃事务。
@@ -2412,9 +2508,12 @@ node_exists() {
 }
 
 node_artifacts_present() {
-    [ -e "$URI_FILE" ] || [ -e "$NODE_CONFIG_DIR" ] ||
-        [ -e "$SS_STATE_FILE" ] || [ -e "$VLESS_STATE_FILE" ] ||
-        [ -e "$SS_URI_FILE" ] || [ -e "$VLESS_URI_FILE" ]
+    [ -e "$URI_FILE" ] || [ -L "$URI_FILE" ] ||
+        [ -e "$NODE_CONFIG_DIR" ] || [ -L "$NODE_CONFIG_DIR" ] ||
+        [ -e "$SS_STATE_FILE" ] || [ -L "$SS_STATE_FILE" ] ||
+        [ -e "$VLESS_STATE_FILE" ] || [ -L "$VLESS_STATE_FILE" ] ||
+        [ -e "$SS_URI_FILE" ] || [ -L "$SS_URI_FILE" ] ||
+        [ -e "$VLESS_URI_FILE" ] || [ -L "$VLESS_URI_FILE" ]
 }
 
 node_config_dir_contents_valid() {
@@ -4396,6 +4495,7 @@ create_or_rebuild_node() {
     local staged_config staged_state
     local existing_port="" existing_protocols="" sibling_ports=""
 
+    confirm_node_dependency_install || return 1
     require_valid_node_state_if_present || return 1
     if protocol_visible_exists ss; then
         load_protocol_state ss || return 1
@@ -4459,7 +4559,7 @@ EOF
     fi
     if ! install_singbox_for_node_transaction; then
         rollback_node_files_transaction || true
-        err "sing-box 安装失败，未创建 Shadowsocks 节点。"
+        err "sing-box 或节点依赖安装失败，未创建 Shadowsocks 节点。"
         return 1
     fi
     info "正在自动生成随机强密码..."
@@ -4532,6 +4632,7 @@ create_vless_reality_node() {
     local sibling_ports=""
     local -a keypair
 
+    confirm_node_dependency_install || return 1
     require_valid_node_state_if_present || return 1
     if protocol_visible_exists vless; then
         load_protocol_state vless || return 1
@@ -4616,7 +4717,7 @@ EOF
     fi
     if ! install_singbox_for_node_transaction; then
         rollback_node_files_transaction || true
-        err "sing-box 安装失败，未创建 VLESS Reality 节点。"
+        err "sing-box 或节点依赖安装失败，未创建 VLESS Reality 节点。"
         return 1
     fi
     if [ "$reality_check_deferred" -eq 1 ]; then
@@ -4710,6 +4811,9 @@ EOF
 view_node_link() {
     local protocol label uri displayed=0
 
+    if node_artifacts_present; then
+        require_node_commands "查看节点链接" jq || return 1
+    fi
     require_valid_node_state_if_present || return 1
     node_exists || { warn "当前没有已创建的节点。"; return 0; }
     write_uri_files || {
@@ -4769,6 +4873,9 @@ delete_node_protocol() {
         ss) label="Shadowsocks"; node_protocols=both ;;
         *) return 2 ;;
     esac
+    if node_artifacts_present; then
+        require_node_commands "删除节点" jq ss sha256sum || return 1
+    fi
     require_valid_node_state_if_present || return 1
     if ! protocol_visible_exists "$protocol"; then
         warn "当前没有已创建的 $label 节点。"
@@ -5277,18 +5384,6 @@ update_singbox() {
         info "如需安装 sing-box，请先创建节点或启动服务。"
         return 0
     fi
-    if node_artifacts_present; then
-        require_valid_node_state_if_present || {
-            err "节点配置完整性未通过，已拒绝更新 sing-box。"
-            return 1
-        }
-        node_exists && check_node_config_set || {
-            err "节点配置未通过当前 sing-box 检查，已拒绝更新。"
-            return 1
-        }
-        had_nodes=1
-    fi
-
     binary_path="$(command -v sing-box)"
     old_version="$(singbox_version)"
     [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || { err "无法识别当前 sing-box 版本，已取消更新。"; return 1; }
@@ -5312,6 +5407,18 @@ update_singbox() {
         info "请先用原安装方式更新或卸载，再由 vpsbox 安装受管版本。"
         return 1
     fi
+    if node_artifacts_present; then
+        ensure_node_dependencies || return 1
+        require_valid_node_state_if_present || {
+            err "节点配置完整性未通过，已拒绝更新 sing-box。"
+            return 1
+        }
+        node_exists && check_node_config_set || {
+            err "节点配置未通过当前 sing-box 检查，已拒绝更新。"
+            return 1
+        }
+        had_nodes=1
+    fi
     backup_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
     backup_binary="$backup_dir/sing-box"
     cp -a "$binary_path" "$backup_binary" || { rm -rf "$backup_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
@@ -5325,7 +5432,7 @@ update_singbox() {
     begin_singbox_update_transaction \
         "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active"
 
-    if ! install_deps; then
+    if ! ensure_node_dependencies; then
         cancel_unmodified_singbox_update_transaction
         err "更新依赖准备失败；sing-box 二进制和服务状态均未修改。"
         return 1
@@ -13917,6 +14024,11 @@ verify_current_node_runtime() {
 }
 
 start_service_action() {
+    if ! node_artifacts_present && ! node_exists; then
+        warn "当前没有节点配置，请先创建节点。"
+        return 0
+    fi
+    ensure_node_runtime_commands || return 1
     require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有节点配置，请先创建节点。"
@@ -13954,6 +14066,11 @@ start_service_action() {
 }
 
 restart_service_action() {
+    if ! node_artifacts_present && ! node_exists; then
+        warn "当前没有节点配置，请先创建节点。"
+        return 0
+    fi
+    ensure_node_runtime_commands || return 1
     require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有节点配置，请先创建节点。"

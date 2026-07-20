@@ -8,6 +8,9 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck source=../vpsbox.sh
 source "$REPO_DIR/vpsbox.sh"
 
+# 更新夹具通过 install_deps 记录依赖阶段，不访问测试宿主机的软件源。
+ensure_node_dependencies() { install_deps; }
+
 MOCK_REMOTE_SCRIPT=""
 MOCK_EVENT_LOG="$TEST_TMP/update-events.log"
 MOCK_CURL_LOG="$TEST_TMP/update-curl.log"
@@ -537,6 +540,7 @@ reset_singbox_case() {
     SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
     # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
     SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
+    # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
     VPSBOX_TEST_MODE=1
 }
 

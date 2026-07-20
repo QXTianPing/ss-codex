@@ -8,6 +8,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck source=../vpsbox.sh
 source "$REPO_DIR/vpsbox.sh"
 
+# 单元测试不访问软件源；需要验证依赖修复时在对应测试内覆盖此探测函数。
+node_dependencies_available() { return 0; }
+missing_node_commands() { printf '\n'; }
+
 cleanup() {
     rm -rf -- "$TEST_TMP"
 }
@@ -1046,6 +1050,7 @@ test_singbox_dependency_failure_does_not_touch_service() {
         singbox_installed() { return 0; }
         singbox_version() { printf '%s\n' 1.13.13; }
         singbox_binary_is_package_managed() { return 0; }
+        node_dependencies_available() { return 1; }
         service_is_running() { return 0; }
         service_is_enabled() { return 0; }
         install_deps() {
@@ -1191,6 +1196,7 @@ test_lockdir_reclaim_guard_serializes_contenders() {
 
 test_openrc_service_does_not_inherit_menu_lock_fd() {
     (
+        # shellcheck disable=SC2034 # 被测的 service_start 动态读取。
         VPSBOX_TEST_MODE=0
         # shellcheck disable=SC2034 # 被测的 service_start 动态读取。
         OS=alpine
@@ -1317,6 +1323,217 @@ test_external_singbox_update_is_rejected_before_mutation() {
     )
 }
 
+test_existing_singbox_still_repairs_node_dependencies() {
+    (
+        local dependencies_ready=0
+        local event_log="$TEST_TMP/node-dependencies.log"
+        : > "$event_log"
+
+        node_dependencies_available() { [ "$dependencies_ready" -eq 1 ]; }
+        install_deps() {
+            printf '%s\n' deps >> "$event_log"
+            dependencies_ready=1
+        }
+        singbox_installed() { return 0; }
+        mark_node_transaction_mutated() {
+            printf '%s\n' mutated >> "$event_log"
+        }
+
+        install_singbox_for_node_transaction
+        assert_file_contains "$event_log" '^deps$' \
+            "已有 sing-box 时也必须补齐节点依赖"
+        assert_file_not_contains "$event_log" '^mutated$' \
+            "仅补齐依赖时不得把节点文件事务标记为已修改"
+    )
+}
+
+test_node_dependency_repair_requires_complete_result() {
+    (
+        local event_log="$TEST_TMP/node-dependencies-incomplete.log"
+        : > "$event_log"
+
+        node_dependencies_available() { return 1; }
+        install_deps() { printf '%s\n' deps >> "$event_log"; }
+
+        if ensure_node_dependencies >"$TEST_TMP/node-dependencies-incomplete.out" 2>&1; then
+            fail "依赖安装后仍不完整时不得继续节点操作"
+        fi
+        assert_file_contains "$event_log" '^deps$'
+        assert_file_contains "$TEST_TMP/node-dependencies-incomplete.out" \
+            'vpsbox 节点管理依赖安装后仍不完整'
+    )
+}
+
+test_node_ca_trust_detection() {
+    (
+        local bundle="$TEST_TMP/test-ca-bundle.crt"
+
+        if node_ca_trust_available "$bundle"; then
+            fail "不存在的 CA 文件不得判定为可用"
+        fi
+        : > "$bundle"
+        if node_ca_trust_available "$bundle"; then
+            fail "空 CA 文件不得判定为可用"
+        fi
+        printf '%s\n' certificate > "$bundle"
+        node_ca_trust_available "$bundle" || fail "非空 CA 文件应判定为可用"
+    )
+}
+
+test_first_singbox_install_prepares_dependencies_once() {
+    (
+        local dependencies_ready=0 installed=0 dependency_runs=0
+
+        node_dependencies_available() { [ "$dependencies_ready" -eq 1 ]; }
+        install_deps() {
+            dependency_runs=$((dependency_runs + 1))
+            dependencies_ready=1
+        }
+        singbox_installed() { [ "$installed" -eq 1 ]; }
+        mark_node_transaction_mutated() { return 0; }
+        detect_os() { return 0; }
+        run_singbox_installer() { installed=1; }
+        singbox_version() { printf '%s\n' 1.13.14; }
+
+        install_singbox_for_node_transaction
+        assert_eq 1 "$dependency_runs" \
+            "首次安装 sing-box 不得重复执行整套依赖安装"
+    )
+}
+
+test_node_dependency_install_requires_confirmation() {
+    local creator
+
+    for creator in create_or_rebuild_node create_vless_reality_node; do
+        (
+            local event_log="$TEST_TMP/$creator-dependency-confirm.log"
+            : > "$event_log"
+
+            node_dependencies_available() { return 1; }
+            confirm_default_yes() { return 1; }
+            install_deps() { printf '%s\n' install >> "$event_log"; }
+            require_valid_node_state_if_present() {
+                printf '%s\n' validation >> "$event_log"
+            }
+            begin_node_transaction() { printf '%s\n' transaction >> "$event_log"; }
+
+            if "$creator" >"$TEST_TMP/$creator-dependency-confirm.out" 2>&1; then
+                fail "$creator 拒绝安装依赖后不得继续"
+            fi
+            assert_empty_file "$event_log" \
+                "$creator 未确认依赖安装时不得安装软件或开始节点流程"
+            assert_file_contains "$TEST_TMP/$creator-dependency-confirm.out" \
+                '已取消，未安装依赖'
+        )
+    done
+}
+
+test_read_only_node_actions_do_not_install_dependencies() {
+    local action
+
+    for action in view_node_link delete_node; do
+        (
+            local event_log="$TEST_TMP/$action-dependency-order.log"
+            : > "$event_log"
+
+            node_artifacts_present() { return 0; }
+            missing_node_commands() { printf '%s\n' jq; }
+            install_deps() { printf '%s\n' install >> "$event_log"; }
+            require_valid_node_state_if_present() {
+                printf '%s\n' validation >> "$event_log"
+            }
+
+            if "$action" >"$TEST_TMP/$action-dependency-order.out" 2>&1; then
+                fail "$action 缺少校验依赖时不得继续"
+            fi
+            assert_empty_file "$event_log" \
+                "$action 不得安装依赖，且依赖缺失后不得进入节点校验"
+            assert_file_contains "$TEST_TMP/$action-dependency-order.out" \
+                '缺少必要命令：jq'
+        )
+    done
+}
+
+test_singbox_update_prepares_dependencies_before_validation() {
+    (
+        local event_log="$TEST_TMP/update_singbox-dependency-order.log"
+        : > "$event_log"
+
+        node_artifacts_present() { return 0; }
+        singbox_installed() { return 0; }
+        singbox_version() { printf '%s\n' 1.13.13; }
+        singbox_binary_is_package_managed() { return 0; }
+        ensure_node_dependencies() {
+            printf '%s\n' dependencies >> "$event_log"
+            return 23
+        }
+        require_valid_node_state_if_present() {
+            printf '%s\n' validation >> "$event_log"
+        }
+
+        if update_singbox >"$TEST_TMP/update_singbox-dependency-order.out" 2>&1; then
+            fail "update_singbox 在依赖准备失败时不得继续"
+        fi
+        assert_eq dependencies "$(cat "$event_log")" \
+            "update_singbox 必须先准备依赖，且失败后不得进入节点校验"
+    )
+}
+
+test_runtime_dependency_install_requires_confirmation() {
+    (
+        local event_log="$TEST_TMP/runtime-dependency-decline.log"
+        : > "$event_log"
+        missing_node_commands() { printf '%s\n' jq; }
+        confirm_default_yes() { return 1; }
+        install_deps() { printf '%s\n' install >> "$event_log"; }
+
+        if ensure_node_runtime_commands >"$TEST_TMP/runtime-dependency-decline.out" 2>&1; then
+            fail "拒绝安装运行依赖后不得继续"
+        fi
+        assert_empty_file "$event_log" "拒绝时不得调用软件包管理器"
+    )
+    (
+        local dependencies_ready=0 dependency_runs=0
+        missing_node_commands() {
+            [ "$dependencies_ready" -eq 1 ] && printf '\n' || printf '%s\n' jq
+        }
+        confirm_default_yes() { return 0; }
+        install_deps() {
+            dependency_runs=$((dependency_runs + 1))
+            dependencies_ready=1
+        }
+
+        ensure_node_runtime_commands
+        assert_eq 1 "$dependency_runs" "确认后运行依赖只能安装一次"
+    )
+}
+
+test_dangling_node_symlink_is_not_treated_as_no_node() {
+    local action
+
+    for action in start_service_action restart_service_action; do
+        (
+            local root="$TEST_TMP/$action-dangling-node"
+            CONFIG_DIR="$root/config"
+            URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
+            NODE_CONFIG_DIR="$CONFIG_DIR/vpsbox.d"
+            SS_STATE_FILE="$CONFIG_DIR/vpsbox-ss.env"
+            VLESS_STATE_FILE="$CONFIG_DIR/vpsbox-vless.env"
+            SS_URI_FILE="$CONFIG_DIR/vpsbox-ss-uri.txt"
+            VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
+            mkdir -p "$CONFIG_DIR"
+            ln -s /definitely/missing-vpsbox-node-dir "$NODE_CONFIG_DIR"
+
+            node_artifacts_present || fail "$action 必须识别悬空的节点符号链接"
+            if "$action" >"$TEST_TMP/$action-dangling-node.out" 2>&1; then
+                fail "$action 不得把悬空节点符号链接误报为无节点"
+            fi
+            assert_file_contains "$TEST_TMP/$action-dangling-node.out" \
+                '检测到节点路径为符号链接'
+        )
+    done
+}
+
 main() {
     local test status passed=0
     local -a tests=(
@@ -1366,6 +1583,15 @@ main() {
         test_singbox_atomic_restore_preserves_current_on_replace_failure
         test_singbox_recovery_rejects_corrupted_backup
         test_external_singbox_update_is_rejected_before_mutation
+        test_existing_singbox_still_repairs_node_dependencies
+        test_node_dependency_repair_requires_complete_result
+        test_node_ca_trust_detection
+        test_first_singbox_install_prepares_dependencies_once
+        test_node_dependency_install_requires_confirmation
+        test_read_only_node_actions_do_not_install_dependencies
+        test_singbox_update_prepares_dependencies_before_validation
+        test_runtime_dependency_install_requires_confirmation
+        test_dangling_node_symlink_is_not_treated_as_no_node
     )
 
     for test in "${tests[@]}"; do
